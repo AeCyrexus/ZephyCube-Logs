@@ -3,8 +3,6 @@ name: Auto release
 on:
   push:
     branches: [main]
-    paths:
-      - "ZephyCubeLogs/**"
   workflow_dispatch:
 
 permissions:
@@ -15,30 +13,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Read version from manifest
-        id: v
-        run: |
-          VERSION=$(jq -r '.header.version | map(tostring) | join(".")' ZephyCubeLogs/manifest.json)
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Package
-        if: steps.v.outputs.exists == 'false'
-        run: |
-          NAME="ZephyCubeLogs-v${{ steps.v.outputs.version }}"
-          zip -r "$NAME.zip" ZephyCubeLogs README.md logo.png
-          (cd ZephyCubeLogs && zip -r "../$NAME.mcpack" .)
-
-      - name: Create release
-        if: steps.v.outputs.exists == 'false'
+      # Walks history oldest -> newest. For every commit that introduces a
+      # manifest version without a matching tag, builds the zip/mcpack from
+      # that commit's files and publishes a release. Already released
+      # versions are skipped, so this is safe to re-run.
+      - name: Release every unreleased version
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          V="v${{ steps.v.outputs.version }}"
-          gh release create "$V" ZephyCubeLogs-"$V".zip ZephyCubeLogs-"$V".mcpack \
-            --target "$GITHUB_SHA" --title "ZephyCubeLogs $V" --generate-notes
+          set -euo pipefail
+          for sha in $(git rev-list --reverse HEAD); do
+            VERSION=$(git show "$sha:ZephyCubeLogs/manifest.json" 2>/dev/null \
+              | jq -r '.header.version | map(tostring) | join(".")') || continue
+            [ -n "$VERSION" ] || continue
+            TAG="v$VERSION"
+            if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+              continue
+            fi
+            echo "Releasing $TAG from $sha"
+            rm -rf build && mkdir -p build/src && git archive "$sha" | tar -x -C build/src
+            NAME="ZephyCubeLogs-$TAG"
+            (cd build/src && zip -qr "../$NAME.zip" . -x '.github/*' '.gitignore')
+            (cd build/src/ZephyCubeLogs && zip -qr "../../$NAME.mcpack" .)
+            gh release create "$TAG" "build/$NAME.zip" "build/$NAME.mcpack" \
+              --target "$sha" --title "ZephyCubeLogs $TAG" --generate-notes
+          done
