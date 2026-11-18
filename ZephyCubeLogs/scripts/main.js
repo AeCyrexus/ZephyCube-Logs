@@ -170,7 +170,7 @@ const xyz = l =>
   l && typeof l.x === "number"
     ? `${COLOR.xyz}(X: ${Math.floor(l.x)}, Y: ${Math.floor(l.y)}, Z: ${Math.floor(l.z)})${T}`
     : `${COLOR.xyz}(X: ?, Y: ?, Z: ?)${T}`;
-const at = (l, dim) => `at ${xyz(l)}${dim && CONFIG.showDimension ? ` in ${COLOR.dimension}${short(dim)}${T}` : ""}`;
+const at = (l, dim) => `at ${xyz(l)}${dim && (CONFIG.showDimension || dim !== "minecraft:overworld") ? ` in ${COLOR.dimension}${short(dim)}${T}` : ""}`;
 const itemList = items =>
   (items ?? []).map(i => `${i.amount ?? 1}x ${cItem(i.item)}`).join(", ") || "nothing";
 
@@ -722,7 +722,10 @@ function lineMatchesContainer(line, targets, dimShort) {
   if (cat !== "I" && cat !== "B") return false;
   const t = lineText(line).replace(/§./g, "");
   const m = LOC_RE.exec(t);
-  if (!m || !t.includes(` in ${dimShort}`)) return false;
+  if (!m) return false;
+  // Lines name the dimension only outside the overworld (or with showDimension); no suffix means overworld
+  const dm = /\) in ([a-z_]+)/.exec(t);
+  if ((dm ? dm[1] : "overworld") !== dimShort) return false;
   if (!targets.some(p => Math.floor(p.x) === +m[1] && Math.floor(p.y) === +m[2] && Math.floor(p.z) === +m[3])) return false;
   if (cat === "I") return /\bopened\b|\btook\b.+\bfrom\b|\bput\b.+\binto\b/.test(t);
   return /\bbroke\b|\bplaced\b/.test(t);
