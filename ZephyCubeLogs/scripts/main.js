@@ -224,6 +224,7 @@ const FORMAT = {
   pressure_plate: r => `${cPlayer(r.player)} stepped on ${cBlock(r.block)} ${at(r.location, r.dimension)}`,
   tripwire: r => `${cPlayer(r.player)} tripped a ${cBlock("tripwire")} ${at(r.location, r.dimension)}`,
   target_hit: r => `${cPlayer(r.player)} hit a ${cBlock("target")} block ${at(r.location, r.dimension)}`,
+  staff_audit: r => `§l§6STAFF§r§f ${cPlayer(r.player)} ${r.action}${r.target ? ` -> ${r.target}` : ""}${r.detail ? `: ${r.detail}` : ""}`,
   possible_dupe: r =>
     `§l§cPOSSIBLE DUPE§r§f ${cPlayer(r.player)} gained ${itemList(r.items)} from nowhere ${at(r.location, r.dimension)}${r.source ? ` | likely source: ${r.source}` : ""}`,
   illegal_stack: r =>
@@ -247,11 +248,11 @@ const CATEGORY = {
   item_use: "I", craft: "I", item_drop: "I", item_pickup: "I", inventory_change: "I",
   container_open: "I", entity_container_open: "I", container_take: "I", container_put: "I",
   cursor_grab: "I", cursor_release: "I",
-  possible_dupe: "D", illegal_stack: "D", server_lag: "P", chat: "P", mob_farm: "E", mob_farm_end: "E",
+  staff_audit: "S", possible_dupe: "D", illegal_stack: "D", server_lag: "P", chat: "P", mob_farm: "E", mob_farm_end: "E",
   lever: "R", button_push: "R", piston: "R", pressure_plate: "R", tripwire: "R", target_hit: "R",
 };
 
-const CAT_NAME = { P: "PLAYER", B: "BLOCK", E: "ENTITY", I: "ITEM", R: "REDSTONE", D: "DUPE" };
+const CAT_NAME = { P: "PLAYER", B: "BLOCK", E: "ENTITY", I: "ITEM", R: "REDSTONE", D: "DUPE", S: "STAFF" };
 
 const pad = n => String(n).padStart(2, "0");
 function timeStamp() {
@@ -262,8 +263,12 @@ function timeStamp() {
 
 const conWin = new Map(); // key -> { start, count, dropped, last, catName }
 function conAllow(type, data, line, catName) {
+  if (type === "staff_audit") return true; // never rate-limited
   const burst = CONFIG.consoleBurst[type] ?? CONFIG.consoleBurst.default;
-  const who = type === "piston" || type === "pressure_plate" || type === "tripwire" ? "" : (data.player ?? data.attacker ?? data.cause ?? "");
+  // PvP and every player death are never rate-limited; kills are keyed per killer (they used to share one bucket
+  // per cause, so mob kills used up the burst and PvP kills were dropped).
+  if (type === "entity_death" && (!data.mobVictim || false)) return true;
+  const who = type === "piston" || type === "pressure_plate" || type === "tripwire" ? "" : (data.player ?? data.attacker ?? data.killer ?? data.cause ?? "");
   const key = `${type}|${who}`;
   const now = Date.now();
   let w = conWin.get(key);
@@ -1128,6 +1133,15 @@ if (CONFIG.logSpawn) {
     });
   });
 }
+
+// Staff audit feed from AdminTools: scriptevent zc:audit player|action|target|detail (script-sent only)
+try {
+  system.afterEvents.scriptEventReceive.subscribe(e => {
+    if (e.id !== "zc:audit" || e.sourceType !== mc.ScriptEventSource.Server) return;
+    const [player = "?", action = "?", target = "", ...rest] = String(e.message).split("|");
+    emit("staff_audit", { player, action, target, detail: rest.join("|") });
+  });
+} catch {}
 
 if (CONFIG.logGameMode) {
   subscribe("playerGameModeChange", world.afterEvents.playerGameModeChange, e => {
