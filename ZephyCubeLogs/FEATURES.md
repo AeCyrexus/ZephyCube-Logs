@@ -15,7 +15,7 @@ Activity logger with an in-game viewer, a chest scanner and a TPS monitor. Origi
 | `dupes` | possible-dupe and illegal-stack hints (per-second scan of what players carry) |
 | `staff_audit` | staff actions sent by AdminTools (`scriptevent zc:audit player\|action\|target\|detail`) |
 | `movement` | throttled movement samples (off in the config by default) |
-| `chat` | chat messages |
+| `chat` | chat messages (requires the Beta APIs experiment and the `-beta` @minecraft/server dependency) |
 | `console` | copy of each line to the server console / ContentLog file (needs `content-log-file-enabled=true`), rate limited per player and event type |
 | `scanner` | chest scanner: right-click a container to see who opened it, what was taken or put in, and who broke or placed it |
 

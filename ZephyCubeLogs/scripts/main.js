@@ -23,7 +23,7 @@ const modOn = defineModules("zclog", "zc:logsmodules", "Logs", [
  * ZephyCubeLogs
  * Author: @iharvs
  *
- * NO Beta APIs are used.
+ * Beta APIs are required ONLY for chat logging (world.afterEvents.chatSend). Enable "Beta APIs" in the world.
  * Logs are saved inside the world (one set per day) and read in the game:
  *   - type  /zc:logs
  *   - or use an item renamed to "logs" in an anvil
@@ -115,7 +115,7 @@ const CONFIG = {
   farmWindowSec: 60,
   farmRadius: 24,
   farmExpireMin: 15,
-  logChat: true,            // chat messages (needs the chatSend event; skipped with a log line if the server does not offer it)
+  logChat: true,            // chat messages (needs the Beta APIs experiment for chatSend; skipped with a log line if unavailable)
   logPossibleDupe: true,    // flag items that appear from nowhere
   dupeCheckTicks: 20,       // how often each player is checked (20 = every second)
   dupeMinAmount: 16,        // ordinary items are flagged only if this many appear at once
@@ -1617,5 +1617,5 @@ if (CONFIG.logMovement) {
 emit("server_logger_started", {
   title: "ZephyCubeLogs",
   author: "@iharvs",
-  betaApisRequired: false
+  betaApisRequired: true
 });
