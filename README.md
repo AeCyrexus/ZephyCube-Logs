@@ -1,6 +1,6 @@
 <p align="center"><img src="logo.png" alt="ZephyCube" width="160"></p>
 
-# ZephyCubeLogs v1.3.5
+# ZephyCubeLogs v1.5.7
 
 Activity logger for Minecraft Bedrock Edition: logs are stored in the world (one set per day) and read in game. No Beta APIs.
 
@@ -13,6 +13,7 @@ Copy the `ZephyCubeLogs` folder into your world's `behavior_packs` folder and ad
 ## Commands
 
 - `/zc:logs`: Open the ZephyCubeLogs viewer
+- `/zc:tps`: Show server TPS (staff)
 
 Operators can open the viewer. Players with the tag `zc_logs` can read logs too.
 

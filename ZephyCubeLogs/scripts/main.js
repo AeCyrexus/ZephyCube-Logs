@@ -26,8 +26,34 @@ const CONFIG = {
   //   "warn" = also show in the console AND write to the ContentLog file (readable text)
   // A script cannot create files itself; the ContentLog file is how Bedrock saves
   // script output. Turn it on in server.properties:  content-log-file-enabled=true
+  tpsWarnBelow: 15,              // log a LAG line when TPS drops below this (at most once per 30 s)
   consoleOutput: "warn",
   // Noisy events that are NOT sent to the file/console (they are still in the in-game viewer)
+  // The ContentLog stays readable: per player and event type at most consoleBurst lines per consoleWindowSec,
+  // then one summary line ("N more ... not written"). The in-game viewer always keeps every event.
+  consoleBurst: { default: 6, chat: 20, block_break: 8, block_place: 8, entity_hurt: 3, entity_death: 4, piston: 2, projectile_hit: 3, entity_interact: 4 },
+  consoleWindowSec: 10,
+  showDimension: false,          // true = add "in overworld" to every location
+  // Kills of these mobs by players are not logged at all (no line in the viewer or the console)
+  ignoreMobKills: [
+    "zombie", "zombie_villager", "zombie_villager_v2", "husk", "drowned", "skeleton", "stray", "bogged", "creeper",
+    "spider", "cave_spider", "enderman", "witch", "slime", "magma_cube", "phantom", "silverfish", "zombified_piglin",
+    "squid", "glow_squid", "cod", "salmon", "tropical_fish", "pufferfish", "bat"
+  ],
+  // Farm animals (cow, pig, sheep, chicken ...) are logged normally. If they die in bulk the spot is detected
+  // as a mob farm and logging stops there (see farmKills).
+  // Common blocks that are NOT written to the ContentLog file/console when broken or placed (still in the in-game viewer).
+  // Containers, ores, redstone, TNT, spawners etc. are not listed, so they are still logged.
+  consoleIgnoreBlocks: [
+    "dirt", "grass_block", "short_grass", "tall_grass", "fern", "large_fern", "grass_path", "dirt_path", "farmland", "coarse_dirt", "rooted_dirt", "mud", "podzol", "mycelium",
+    "stone", "cobblestone", "deepslate", "cobbled_deepslate", "tuff", "granite", "diorite", "andesite", "netherrack", "basalt", "blackstone", "end_stone", "cobblestone_wall",
+    "sand", "red_sand", "gravel", "sandstone", "clay", "snow", "snow_layer", "ice", "packed_ice", "water", "flowing_water",
+    "oak_log", "birch_log", "spruce_log", "jungle_log", "acacia_log", "dark_oak_log", "mangrove_log", "cherry_log", "pale_oak_log",
+    "oak_leaves", "birch_leaves", "spruce_leaves", "jungle_leaves", "acacia_leaves", "dark_oak_leaves", "mangrove_leaves", "cherry_leaves", "azalea_leaves", "pale_oak_leaves",
+    "oak_planks", "spruce_planks", "birch_planks", "short_dry_grass", "tall_dry_grass", "bush", "firefly_bush", "leaf_litter", "vine", "sugar_cane", "bamboo", "kelp", "seagrass", "tall_seagrass",
+    "dandelion", "poppy", "cornflower", "azure_bluet", "oxeye_daisy", "wheat", "carrots", "potatoes", "beetroot", "pumpkin", "melon_block", "sweet_berry_bush", "cactus",
+    "torch", "wall_torch", "soul_torch", "scaffolding", "air"
+  ],
   consoleSkip: ["inventory_change", "cursor_grab", "cursor_release", "item_use", "block_interact",
     "effect_add", "item_drop", "item_pickup", "movement", "container_open", "entity_container_open"],
   scannerItemName: "scanner",    // item renamed to this opens the chest scanner
@@ -52,7 +78,7 @@ const CONFIG = {
   logCombat: true,               // only fights that involve a player
   logDeath: true,                // player deaths and mobs killed by a player
   logJoinLeave: true,
-  logDimension: true,
+  logDimension: false,
   logContainer: true,            // opening chests etc, and what was taken out or put in
   logCursor: true,               // picking up / putting down an item with the cursor (dragging)
   logSpawn: true,           // first spawn and respawn after death
@@ -66,6 +92,14 @@ const CONFIG = {
   logProjectile: true,      // arrows, tridents, snowballs hitting something alive
   logTame: true,
   logEmote: false,
+  // Mob farms: when farmKills mobs of one type die within farmRadius blocks inside farmWindowSec seconds, that area is
+  // marked as a mob farm. Mob deaths, mob damage and pistons inside it are not logged until farmExpireMin minutes after
+  // the last death there. Deaths and damage involving a PLAYER as the victim are always logged.
+  farmKills: 15,
+  farmWindowSec: 60,
+  farmRadius: 24,
+  farmExpireMin: 15,
+  logChat: true,            // chat messages (needs the chatSend event; skipped with a log line if the server does not offer it)
   logPossibleDupe: true,    // flag items that appear from nowhere
   dupeCheckTicks: 20,       // how often each player is checked (20 = every second)
   dupeMinAmount: 16,        // ordinary items are flagged only if this many appear at once
@@ -105,6 +139,7 @@ function playerName(p) {
   return p?.name ?? "Unknown";
 }
 
+const CONFIG_IGNORE = new Set(CONFIG.consoleIgnoreBlocks);
 function safeType(obj) {
   try { return obj?.typeId ?? obj?.type?.id ?? "unknown"; } catch { return "unknown"; }
 }
@@ -135,7 +170,7 @@ const xyz = l =>
   l && typeof l.x === "number"
     ? `${COLOR.xyz}(X: ${Math.floor(l.x)}, Y: ${Math.floor(l.y)}, Z: ${Math.floor(l.z)})${T}`
     : `${COLOR.xyz}(X: ?, Y: ?, Z: ?)${T}`;
-const at = (l, dim) => `at ${xyz(l)}${dim ? ` in ${COLOR.dimension}${short(dim)}${T}` : ""}`;
+const at = (l, dim) => `at ${xyz(l)}${dim && CONFIG.showDimension ? ` in ${COLOR.dimension}${short(dim)}${T}` : ""}`;
 const itemList = items =>
   (items ?? []).map(i => `${i.amount ?? 1}x ${cItem(i.item)}`).join(", ") || "nothing";
 
@@ -165,7 +200,7 @@ const FORMAT = {
   container_open: r => `${cPlayer(r.player)} opened ${cBlock(r.block)} ${at(r.location, r.dimension)}`,
   entity_container_open: r => `${cPlayer(r.player)} opened ${cEntity(r.entity)} ${at(r.location, r.dimension)}`,
   movement: r =>
-    `${cPlayer(r.player)} moved ${r.distance} blocks from ${xyz(r.from)} to ${xyz(r.to)} in ${COLOR.dimension}${short(r.to?.dimension)}${T}`,
+    `${cPlayer(r.player)} moved ${r.distance} blocks from ${xyz(r.from)} to ${xyz(r.to)} ${CONFIG.showDimension ? ` in ${COLOR.dimension}${short(r.to?.dimension)}${T}` : ""}`,
   gamemode_change: r => `${cPlayer(r.player)} changed game mode from ${r.from} to ${r.to}`,
   craft: r => `${cPlayer(r.player)} crafted ${r.amount ?? 1}x ${cItem(r.item)}`,
   item_drop: r => `${cPlayer(r.player)} dropped ${itemList(r.items)} ${at(r.location, r.dimension)}`,
@@ -197,6 +232,10 @@ const FORMAT = {
     `§l§6INVENTORY AT DEATH§r§f ${cPlayer(r.player)} (${r.total ?? 0} items) ${at(r.location, r.dimension)}: ` +
     ((r.items ?? []).length ? r.items.map(i => `${COLOR.item}${i}${T}`).join(", ") : "nothing"),
   emote: r => `${cPlayer(r.player)} did an emote`,
+  chat: r => `${cPlayer(r.player)}: §f${r.message}`,
+  mob_farm: r => `§l§6MOB FARM§r§f ${r.kills} ${short(r.mob)} deaths in ${r.seconds}s ${at(r.location, r.dimension)} - mob deaths, mob damage and pistons within ${r.radius} blocks are no longer logged`,
+  mob_farm_end: r => `§l§6MOB FARM ENDED§r§f no deaths for ${r.minutes} min ${at(r.location, r.dimension)} - logging resumes there`,
+  server_lag: r => `§l§cLAG§r§f ${r.tps} TPS with ${r.players} players online`,
 };
 
 // Which filter button each event belongs to: P player, B blocks, E entity, I items, R redstone
@@ -208,7 +247,7 @@ const CATEGORY = {
   item_use: "I", craft: "I", item_drop: "I", item_pickup: "I", inventory_change: "I",
   container_open: "I", entity_container_open: "I", container_take: "I", container_put: "I",
   cursor_grab: "I", cursor_release: "I",
-  possible_dupe: "D", illegal_stack: "D",
+  possible_dupe: "D", illegal_stack: "D", server_lag: "P", chat: "P", mob_farm: "E", mob_farm_end: "E",
   lever: "R", button_push: "R", piston: "R", pressure_plate: "R", tripwire: "R", target_hit: "R",
 };
 
@@ -221,7 +260,95 @@ function timeStamp() {
     `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
 }
 
+const conWin = new Map(); // key -> { start, count, dropped, last, catName }
+function conAllow(type, data, line, catName) {
+  const burst = CONFIG.consoleBurst[type] ?? CONFIG.consoleBurst.default;
+  const who = type === "piston" || type === "pressure_plate" || type === "tripwire" ? "" : (data.player ?? data.attacker ?? data.cause ?? "");
+  const key = `${type}|${who}`;
+  const now = Date.now();
+  let w = conWin.get(key);
+  if (!w || now - w.start > CONFIG.consoleWindowSec * 1000) {
+    if (w && w.dropped > 0) conSummary(key, w);
+    w = { start: now, count: 0, dropped: 0, last: "", catName };
+    conWin.set(key, w);
+  }
+  w.count++;
+  if (w.count <= burst) return true;
+  w.dropped++; w.last = line;
+  return false;
+}
+function conSummary(key, w) {
+  const [type, who] = key.split("|");
+  const line = `[ZephyCubeLogs] ${timeStamp()} [${w.catName}] +${w.dropped} more ${type}${who ? " by " + who : ""} in ${CONFIG.consoleWindowSec}s not written here (in-game viewer has all). Last: ${w.last.replace(/^\[ZephyCubeLogs\] \S+ \S+ \[\w+\] /, "")}`;
+  if (CONFIG.consoleOutput === "warn") console.warn(line); else console.log(line);
+}
+system.runInterval(() => {
+  const now = Date.now();
+  for (const [key, w] of conWin) {
+    if (now - w.start > CONFIG.consoleWindowSec * 1000) {
+      if (w.dropped > 0) conSummary(key, w);
+      conWin.delete(key);
+    }
+  }
+}, 100);
+
+/* ---------- mob farm detection ---------- */
+
+const farms = []; // { dim, x, z, last, mob }
+const recentDeaths = new Map(); // `${dim}|${mob}` -> [{ t, x, z }]
+const FARM_QUIET = new Set(["entity_hurt", "entity_death", "projectile_hit", "piston"]);
+
+function farmAt(dim, loc) {
+  if (!loc) return false;
+  const r2 = CONFIG.farmRadius * CONFIG.farmRadius;
+  for (const f of farms) {
+    if (f.dim !== dim) continue;
+    const dx = loc.x - f.x, dz = loc.z - f.z;
+    if (dx * dx + dz * dz <= r2) return f;
+  }
+  return false;
+}
+
+function noteMobDeath(ent) {
+  try {
+    const dim = ent.dimension?.id, loc = ent.location, mob = ent.typeId;
+    if (!dim || !loc || !mob) return;
+    const now = Date.now();
+    const f = farmAt(dim, loc);
+    if (f) { f.last = now; return; }
+    const key = `${dim}|${mob}`;
+    let list = recentDeaths.get(key);
+    if (!list) { list = []; recentDeaths.set(key, list); }
+    list.push({ t: now, x: loc.x, z: loc.z });
+    while (list.length && now - list[0].t > CONFIG.farmWindowSec * 1000) list.shift();
+    const r2 = CONFIG.farmRadius * CONFIG.farmRadius;
+    const near = list.filter(d => (d.x - loc.x) ** 2 + (d.z - loc.z) ** 2 <= r2);
+    if (near.length >= CONFIG.farmKills) {
+      const cx = near.reduce((a, d) => a + d.x, 0) / near.length;
+      const cz = near.reduce((a, d) => a + d.z, 0) / near.length;
+      farms.push({ dim, x: cx, z: cz, last: now, mob });
+      recentDeaths.delete(key);
+      emit("mob_farm", { mob, kills: near.length, seconds: CONFIG.farmWindowSec, radius: CONFIG.farmRadius, location: { x: cx, y: loc.y, z: cz }, dimension: dim });
+    }
+    if (recentDeaths.size > 200) recentDeaths.clear();
+  } catch {}
+}
+
+system.runInterval(() => {
+  try {
+    const now = Date.now();
+    for (let i = farms.length - 1; i >= 0; i--) {
+      const f = farms[i];
+      if (now - f.last > CONFIG.farmExpireMin * 60000) {
+        farms.splice(i, 1);
+        emit("mob_farm_end", { minutes: CONFIG.farmExpireMin, location: { x: f.x, y: 64, z: f.z }, dimension: f.dim });
+      }
+    }
+  } catch {}
+}, 200);
+
 function emit(type, data = {}) {
+  if (FARM_QUIET.has(type) && (type === "piston" || data.mobVictim) && farmAt(data.dimension, data.location)) return;
   let text;
   try {
     text = FORMAT[type] ? FORMAT[type](data) : `${type} ${JSON.stringify(data)}`;
@@ -232,21 +359,48 @@ function emit(type, data = {}) {
   buffer.push({ day: stamp.slice(0, 10), line: `${CATEGORY[type] ?? "P"}|${COLOR.time}${stamp.slice(11)}${T} ${text}` });
   if (CONFIG.consoleOutput !== "none" && !CONFIG.consoleSkip.includes(type)) {
     const plain = text.replace(/§./g, ""); // no color codes in the file
-    const line = `[ZephyCubeLogs] ${stamp} [${CAT_NAME[CATEGORY[type] ?? "P"]}] ${plain}`;
-    if (CONFIG.consoleOutput === "warn") console.warn(line);
-    else console.log(line);
+    const catName = CAT_NAME[CATEGORY[type] ?? "P"];
+    const line = `[ZephyCubeLogs] ${stamp} [${catName}] ${plain}`;
+    if ((type === "block_break" || type === "block_place") && CONFIG_IGNORE.has(short(data.block))) { /* common block, not written to the file */ }
+    else if (conAllow(type, data, line, catName)) {
+      if (CONFIG.consoleOutput === "warn") console.warn(line);
+      else console.log(line);
+    }
   }
 }
 
 const isPlayer = ent => ent?.typeId === "minecraft:player";
-const who = ent => (isPlayer(ent) ? playerName(ent) : ent?.nameTag || safeType(ent));
+// CrossBlades duels / team duels / FFA: players carry a crossblades:* tag. Kept for 10 s after the tag goes (the tag can be cleared before the death event).
+const cbSeen = new Map();
+function inCrossBlades(ent) {
+  try {
+    if (!ent) return false;
+    if (ent.getTags().some(t => t.startsWith("crossblades:"))) { cbSeen.set(ent.id, system.currentTick); return true; }
+  } catch {}
+  const t = cbSeen.get(ent?.id);
+  return t !== undefined && system.currentTick - t < 200;
+}
+system.runInterval(() => {
+  for (const p of world.getAllPlayers()) inCrossBlades(p);
+  if (cbSeen.size > 100) for (const [k, t] of cbSeen) if (system.currentTick - t > 1200) cbSeen.delete(k);
+}, 20);
+const who = ent => {
+  try { return isPlayer(ent) ? playerName(ent) : ent?.nameTag || safeType(ent); } catch { return "unknown"; } // entity may already be removed
+};
 
 function subscribe(name, signal, handler) {
   if (!signal) {
     console.warn(`[ZEPHYCUBE_LOGS] Event "${name}" is not available on this server version, skipping it.`);
     return;
   }
-  try { signal.subscribe(handler); } catch (e) {
+  const safe = ev => {
+    try { return handler(ev); } catch (err) {
+      // An entity that was removed in the same tick (killed, picked up, despawned) throws InvalidEntityError when read: harmless.
+      if (String(err?.name ?? err).includes("InvalidEntity") || String(err).includes("Entity being invalid") || String(err).includes("has the Entity been removed")) return;
+      throw err;
+    }
+  };
+  try { signal.subscribe(safe); } catch (e) {
     console.warn(`[ZEPHYCUBE_LOGS] Could not listen for "${name}": ${e}`);
   }
 }
@@ -446,7 +600,48 @@ async function viewPages(player, day, cat, search, label) {
   }
 }
 
-// Way 1: the command /zc:logs (works with cheats off)
+
+/* ---------- TPS monitor (/zc:tps) ---------- */
+
+const tpsLog = []; // { t, tps }, one sample every 5 s, kept for 5 minutes
+let tpsLastWall = null, tpsLastTick = 0, tpsLastWarn = 0, tpsStart = null;
+try {
+system.runInterval(() => {
+  try {
+    const now = Date.now(), tick = system.currentTick;
+    if (tpsStart === null) tpsStart = now;
+    const dt = tpsLastWall === null ? 0 : (now - tpsLastWall) / 1000;
+    if (dt > 0.5) {
+      const tps = Math.min(20, (tick - tpsLastTick) / dt);
+      tpsLog.push({ t: now, tps });
+      while (tpsLog.length && now - tpsLog[0].t > 300000) tpsLog.shift();
+      if (tps < CONFIG.tpsWarnBelow && now - tpsLastWarn > 30000 && now - tpsStart > 120000) { // not during the first 2 minutes (startup)
+        tpsLastWarn = now;
+        emit("server_lag", { tps: tps.toFixed(1), players: world.getAllPlayers().length });
+      }
+    }
+    tpsLastWall = now; tpsLastTick = tick;
+  } catch {}
+}, 100);
+} catch (e) { console.warn(`[ZEPHYCUBE_LOGS] TPS sampler not started: ${e}`); }
+
+function avgTps(sec) {
+  const now = Date.now();
+  const a = tpsLog.filter(x => now - x.t <= sec * 1000);
+  return a.length ? a.reduce((sum, x) => sum + x.tps, 0) / a.length : null;
+}
+
+function tpsReport() {
+  const f = v => (v === null ? "n/a" : v.toFixed(1));
+  const c = v => (v === null ? "§7" : v >= 18 ? "§a" : v >= 15 ? "§e" : "§c");
+  const n10 = avgTps(10), m1 = avgTps(60), m5 = avgTps(300);
+  const worst = tpsLog.length ? Math.min(...tpsLog.map(x => x.tps)) : null;
+  let ents = 0;
+  try { for (const d of ["overworld", "nether", "the_end"]) ents += world.getDimension(d).getEntities().length; } catch {}
+  return `§6[ZephyCubeLogs] TPS§r now ${c(n10)}${f(n10)}§r | 1m ${c(m1)}${f(m1)}§r | 5m ${c(m5)}${f(m5)}§r | worst ${c(worst)}${f(worst)}§r | players ${world.getAllPlayers().length} | entities ${ents}`;
+}
+
+// Way 1: the commands /zc:logs and /zc:tps (works with cheats off). A pack can only use ONE command namespace.
 try {
   system.beforeEvents.startup.subscribe(init => {
     try {
@@ -465,6 +660,27 @@ try {
       );
     } catch (e) {
       console.warn(`[ZEPHYCUBE_LOGS] Could not register /zc:logs: ${e}`);
+    }
+    console.warn("[ZEPHYCUBE_LOGS] registering commands: zc:logs, zc:tps");
+    try {
+      init.customCommandRegistry.registerCommand(
+        {
+          name: "zc:tps",
+          description: "Show server TPS (staff)",
+          permissionLevel: mc.CommandPermissionLevel?.Any ?? 0,
+          cheatsRequired: false
+        },
+        origin => {
+          const player = origin.sourceEntity;
+          const isPlayer = player?.typeId === "minecraft:player";
+          if (isPlayer && !canViewLogs(player)) return { status: mc.CustomCommandStatus?.Failure ?? 1, message: "Staff only." };
+          const text = tpsReport();
+          if (isPlayer) { system.run(() => { try { player.sendMessage(text); } catch {} }); return { status: mc.CustomCommandStatus?.Success ?? 0 }; }
+          return { status: mc.CustomCommandStatus?.Success ?? 0, message: text.replace(/§./g, "") };
+        }
+      );
+    } catch (e) {
+      console.warn(`[ZEPHYCUBE_LOGS] Could not register /zc:tps: ${e}`);
     }
   });
 } catch (e) {
@@ -625,6 +841,20 @@ if (CONFIG.logInteract) {
   subscribe("playerInteractWithBlock", world.afterEvents.playerInteractWithBlock, e => {
     if (!e.isFirstEvent) return;
     if (justPlaced(e.player)) return; // part of placing a block, already logged
+    // Buckets and fire are not block placements for the API: log what they put down (lava, powder snow, water, fire)
+    const placedByItem = { "minecraft:lava_bucket": "lava", "minecraft:powder_snow_bucket": "powder_snow", "minecraft:water_bucket": "water", "minecraft:flint_and_steel": "fire", "minecraft:fire_charge": "fire" }[e.itemStack?.typeId];
+    if (placedByItem) {
+      const o = { Up: [0, 1, 0], Down: [0, -1, 0], North: [0, 0, -1], South: [0, 0, 1], East: [1, 0, 0], West: [-1, 0, 0] }[e.blockFace] ?? [0, 0, 0];
+      const bl = e.block?.location;
+      lastPlaceTick.set(e.player?.id, system.currentTick);
+      emit("block_place", {
+        player: playerName(e.player),
+        block: "minecraft:" + placedByItem,
+        location: bl ? { x: bl.x + o[0], y: bl.y + o[1], z: bl.z + o[2] } : bl,
+        dimension: e.block?.dimension?.id
+      });
+      return;
+    }
     emit("block_interact", {
       player: playerName(e.player),
       block: safeType(e.block?.permutation),
@@ -641,9 +871,9 @@ if (CONFIG.logEntityInteract) {
     emit("entity_interact", {
       player: playerName(e.player),
       entity: safeType(e.target),
-      targetName: e.target?.nameTag ?? "",
-      location: e.target?.location,
-      dimension: e.target?.dimension?.id
+      targetName: (() => { try { return e.target?.nameTag ?? ""; } catch { return ""; } })(),
+      location: (() => { try { return e.target?.location; } catch { return undefined; } })(),
+      dimension: (() => { try { return e.target?.dimension?.id; } catch { return undefined; } })()
     });
   });
 }
@@ -678,9 +908,13 @@ if (CONFIG.logCombat) {
     const victim = e.hurtEntity;
     const attacker = e.damageSource?.damagingEntity;
     if (!victim) return;
-    if (!isPlayer(victim) && !isPlayer(attacker)) return; // ignore mob vs mob
+    let tamedVictim = false;
+    try { tamedVictim = !isPlayer(victim) && victim.hasComponent("minecraft:is_tamed"); } catch {}
+    if (!tamedVictim && (!isPlayer(victim) || !isPlayer(attacker))) return; // damage lines: player vs player, or anyone hurting a tamed animal
+    if (inCrossBlades(victim) || inCrossBlades(attacker)) return; // duels / FFA are not PvP
     emit("entity_hurt", {
       victim: who(victim),
+      mobVictim: !isPlayer(victim),
       attacker: attacker ? who(attacker) : "",
       cause: e.damageSource?.cause,
       damage: e.damage,
@@ -695,6 +929,7 @@ if (CONFIG.logCombat) {
 // last known contents are kept and written out when the player dies.
 const invSnapshots = new Map(); // player id -> { list: string[], count: number }
 const invDirty = new Set();
+const lastFull = new Map(); // player id -> last NON-empty snapshot { list, count, tick }
 function describeStack(stack) {
   let t = `${stack.amount}x ${short(stack.typeId)}`;
   try { if (stack.nameTag) t += ` "${stack.nameTag}"`; } catch {}
@@ -724,7 +959,11 @@ function snapshotInventory(player) {
       if (eq) for (const slot of ["Head", "Chest", "Legs", "Feet", "Offhand"]) take(eq.getEquipment(slot), slot.toLowerCase());
     } catch {}
     for (const [id, n] of plain) parts.push(`${n}x ${short(id)}`);
-    invSnapshots.set(player.id, { list: parts, count });
+    let loc, dim;
+    try { loc = player.location; dim = player.dimension?.id; } catch {}
+    const snap = { list: parts, count, loc, dim, tick: system.currentTick };
+    invSnapshots.set(player.id, snap);
+    if (count > 0) lastFull.set(player.id, snap);
   } catch {}
 }
 if (CONFIG.logDeathInventory) {
@@ -732,9 +971,12 @@ if (CONFIG.logDeathInventory) {
     if (e.player) invDirty.add(e.player.id);
   });
   subscribe("entityHurt (snapshot)", world.afterEvents.entityHurt, e => {
-    if (isPlayer(e.hurtEntity)) snapshotInventory(e.hurtEntity); // fresh copy right before a possible death
+    if (!isPlayer(e.hurtEntity)) return;
+    const id = e.hurtEntity.id, last = invSnapshots.get(id);
+    if (last && !invDirty.has(id) && system.currentTick - last.tick < 10) return; // unchanged and fresh: no need to scan 40 slots on every hit
+    snapshotInventory(e.hurtEntity); // fresh copy right before a possible death
   });
-  subscribe("playerLeave (snapshot)", world.afterEvents.playerLeave, e => { invSnapshots.delete(e.playerId); invDirty.delete(e.playerId); });
+  subscribe("playerLeave (snapshot)", world.afterEvents.playerLeave, e => { invSnapshots.delete(e.playerId); invDirty.delete(e.playerId); lastFull.delete(e.playerId); });
   system.runInterval(() => {
     for (const p of world.getAllPlayers()) {
       if (invDirty.has(p.id) || !invSnapshots.has(p.id)) { invDirty.delete(p.id); snapshotInventory(p); }
@@ -747,22 +989,34 @@ if (CONFIG.logDeath) {
   subscribe("entityDie", world.afterEvents.entityDie, e => {
     const ent = e.deadEntity;
     const killer = e.damageSource?.damagingEntity;
+    if (ent && !isPlayer(ent)) noteMobDeath(ent);
     if (!isPlayer(ent) && !isPlayer(killer)) return; // ignore mobs dying on their own
+    if (inCrossBlades(ent) || inCrossBlades(killer)) return; // duels / FFA: no kill line, no death inventory
+    if (!isPlayer(ent) && CONFIG.ignoreMobKills.includes(String(ent?.typeId ?? "").replace("minecraft:", ""))) return; // common mobs: not logged
+    let loc, dimId;
+    try { loc = ent?.location; dimId = ent?.dimension?.id; } catch {}
+    const snap = invSnapshots.get(ent?.id);
+    if (!loc && snap) { loc = snap.loc; dimId = snap.dim; }
     emit("entity_death", {
+      mobVictim: !isPlayer(ent),
       entity: who(ent),
       killer: killer ? who(killer) : "",
       cause: e.damageSource?.cause,
-      location: ent?.location,
-      dimension: ent?.dimension?.id
+      location: loc,
+      dimension: dimId
     });
     if (CONFIG.logDeathInventory && isPlayer(ent)) {
-      const snap = invSnapshots.get(ent.id);
+      // The gravestone/keepInventory logic empties the inventory around the death, so an empty snapshot
+      // taken within 5 s of the death is replaced by the last non-empty one.
+      let use = snap;
+      const full = lastFull.get(ent.id);
+      if ((!use || use.count === 0) && full && system.currentTick - full.tick < 100) use = full;
       emit("death_inventory", {
         player: playerName(ent),
-        items: snap?.list ?? [],
-        total: snap?.count ?? 0,
-        location: ent.location,
-        dimension: ent.dimension?.id
+        items: use?.list ?? [],
+        total: use?.count ?? 0,
+        location: loc,
+        dimension: dimId
       });
     }
   });
@@ -976,6 +1230,7 @@ if (CONFIG.logProjectile) {
     emit("projectile_hit", {
       shooter: e.source ? who(e.source) : "unknown",
       projectile: safeType(e.projectile),
+      mobVictim: !!victim && !isPlayer(victim),
       victim: victim ? who(victim) : "unknown",
       location: e.location,
       dimension: e.dimension?.id
@@ -991,6 +1246,12 @@ if (CONFIG.logTame) {
       location: e.entity?.location,
       dimension: e.entity?.dimension?.id
     });
+  });
+}
+
+if (CONFIG.logChat) {
+  subscribe("chatSend", world.afterEvents?.chatSend, e => {
+    emit("chat", { player: playerName(e.sender), message: String(e.message ?? "").replace(/§./g, "").slice(0, 300) });
   });
 }
 
@@ -1168,7 +1429,9 @@ if (CONFIG.logPossibleDupe) {
 
   subscribe("entityItemPickup", world.afterEvents.entityItemPickup, e => {
     if (!isPlayer(e.entity)) return;
-    for (const stack of e.items ?? []) addCredit(e.entity.id, stack.typeId, stack.amount, 200);
+    let stacks = [];
+    try { stacks = (e.items ?? []).map(x => x); } catch { try { stacks = Array.from(e.items); } catch {} }
+    for (const stack of stacks) addCredit(e.entity.id, stack.typeId, stack.amount, 200);
   });
 
   // Gravestones (Admin Tools) hand a player's saved items back: that is not a dupe.
@@ -1217,7 +1480,7 @@ if (CONFIG.logPossibleDupe) {
         // CrossBlades duels / FFA / kits clear and refill the inventory (and restore it afterwards).
         // Those items come from nowhere by design, so do not judge the player during or just after.
         let cbTag = false;
-        try { cbTag = player.getTags().some(t => t.startsWith("crossblades:")); } catch {}
+        try { cbTag = player.getTags().some(t => t.startsWith("crossblades:") || t === "zc:grave"); } catch {}
         if (cbTag) cbLast.set(id, system.currentTick);
         const inGrace = system.currentTick - (cbLast.get(id) ?? -999999) < CONFIG.dupeKitGraceSec * 20;
         if (inGrace) pending.delete(id);
