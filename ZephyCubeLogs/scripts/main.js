@@ -1,0 +1,1003 @@
+import * as mc from "@minecraft/server";
+import { ActionFormData, ModalFormData } from "@minecraft/server-ui";
+
+const { world, system } = mc;
+
+/*
+ * ZephyCubeLogs
+ * Author: @iharvs
+ *
+ * NO Beta APIs are used.
+ * Logs are saved inside the world (one set per day) and read in the game:
+ *   - type  /zc:logs
+ *   - or use an item renamed to "logs" in an anvil
+ * Only operators (or players with the tag "zc_logs") can open it.
+ */
+
+const CONFIG = {
+  // Where each event goes besides the in-game database:
+  //   "none" = nowhere else (no lag from the server log)
+  //   "log"  = also show in the live server console
+  //   "warn" = also write to the server's ContentLog file
+  consoleOutput: "none",
+  keepDays: 7,                   // older days are deleted automatically
+  pageChars: 2500,               // text per page in the viewer
+  maxPagesPerDay: 200,           // oldest pages of a day are dropped beyond this
+  saveIntervalTicks: 100,        // save to the database every 5 seconds
+  viewerTag: "zc_logs",    // non-operators with this tag can also read logs
+  viewerItemName: "logs",        // use an item with this name to open the viewer
+  timezoneOffsetHours: 8,        // times in the log use this offset from UTC (8 = Philippines)
+  movementIntervalTicks: 20,     // 1 second
+  movementMinDistance: 10,       // blocks
+  maxQueue: 2000,
+  logMovement: false,
+  logBlockBreak: true,
+  logBlockPlace: true,
+  logInteract: true,
+  logEntityInteract: true,
+  logInventory: true,
+  logItemUse: true,
+  logCombat: true,               // only fights that involve a player
+  logDeath: true,                // player deaths and mobs killed by a player
+  logJoinLeave: true,
+  logDimension: true,
+  logContainer: true,            // opening chests etc, and what was taken out or put in
+  logCursor: true,               // picking up / putting down an item with the cursor (dragging)
+  logSpawn: true,           // first spawn and respawn after death
+  logGameMode: true,
+  logCraft: true,
+  logItemDropPickup: true,  // players only
+  logEffects: true,         // players only
+  logRedstone: true,        // levers, buttons, pistons, pressure plates, tripwires
+  redstoneQuietSeconds: 10, // the same piston/plate is logged at most once in this time
+  logExplosion: true,
+  logProjectile: true,      // arrows, tridents, snowballs hitting something alive
+  logTame: true,
+  logEmote: false,
+  logPossibleDupe: true,    // flag items that appear from nowhere
+  dupeCheckTicks: 20,       // how often each player is checked (20 = every second)
+  dupeMinAmount: 16,        // ordinary items are flagged only if this many appear at once
+  dupeAlertOperators: false, // also send a chat message to online operators
+  // Valuable items: flagged even if just 1 appears from nowhere
+  dupeWatchItems: [
+    "minecraft:diamond", "minecraft:diamond_block", "minecraft:emerald", "minecraft:emerald_block",
+    "minecraft:netherite_ingot", "minecraft:netherite_block", "minecraft:netherite_scrap", "minecraft:ancient_debris",
+    "minecraft:gold_block", "minecraft:iron_block", "minecraft:totem_of_undying", "minecraft:elytra",
+    "minecraft:enchanted_golden_apple", "minecraft:nether_star", "minecraft:beacon", "minecraft:dragon_egg",
+    "minecraft:shulker_shell", "minecraft:undyed_shulker_box", "minecraft:trident", "minecraft:mace",
+    "minecraft:heavy_core", "minecraft:end_crystal", "minecraft:tnt"
+  ],
+};
+
+const lastPos = new Map();
+const lastPlaceTick = new Map();
+const justPlaced = p => system.currentTick - (lastPlaceTick.get(p?.id) ?? -100) <= 2;
+
+function pos(p) {
+  const l = p.location;
+  return {
+    x: Math.floor(l.x),
+    y: Math.floor(l.y),
+    z: Math.floor(l.z),
+    dimension: p.dimension?.id ?? "unknown"
+  };
+}
+
+function playerName(p) {
+  return p?.name ?? "Unknown";
+}
+
+function safeType(obj) {
+  try { return obj?.typeId ?? obj?.type?.id ?? "unknown"; } catch { return "unknown"; }
+}
+
+/* ---------- plain-text formatting ---------- */
+
+const short = id => String(id ?? "unknown").replace(/^minecraft:/, "");
+
+// Colors (Minecraft color codes). Change them here if you want other colors.
+const COLOR = {
+  time: "§7",      // gray
+  player: "§b",    // aqua
+  xyz: "§e",       // yellow
+  block: "§a",     // green
+  entity: "§c",    // red
+  item: "§d",      // pink
+  dimension: "§9", // blue
+  text: "§f",      // white
+};
+const T = COLOR.text;
+const cPlayer = n => `${COLOR.player}${n}${T}`;
+const cBlock = id => `${COLOR.block}${short(id)}${T}`;
+const cEntity = id => `${COLOR.entity}${short(id)}${T}`;
+const cItem = id => `${COLOR.item}${short(id)}${T}`;
+// A value like "minecraft:zombie" is a mob; anything else is a player name.
+const cWho = v => (String(v ?? "").includes(":") ? cEntity(v) : cPlayer(v));
+const xyz = l =>
+  l && typeof l.x === "number"
+    ? `${COLOR.xyz}(X: ${Math.floor(l.x)}, Y: ${Math.floor(l.y)}, Z: ${Math.floor(l.z)})${T}`
+    : `${COLOR.xyz}(X: ?, Y: ?, Z: ?)${T}`;
+const at = (l, dim) => `at ${xyz(l)}${dim ? ` in ${COLOR.dimension}${short(dim)}${T}` : ""}`;
+const itemList = items =>
+  (items ?? []).map(i => `${i.amount ?? 1}x ${cItem(i.item)}`).join(", ") || "nothing";
+
+const FORMAT = {
+  server_logger_started: () => `=== ZephyCubeLogs started ===`,
+  player_join: r => `${cPlayer(r.player)} joined the server`,
+  player_leave: r => `${cPlayer(r.player)} left the server`,
+  player_spawn: r => `${cPlayer(r.player)} spawned ${at(r.location, r.dimension)}`,
+  player_respawn: r => `${cPlayer(r.player)} respawned ${at(r.location, r.dimension)}`,
+  block_break: r =>
+    `${cPlayer(r.player)} broke ${cBlock(r.block)} (${r.tool === "unknown" ? "empty hand" : "holding " + cItem(r.tool)}) ${at(r.location, r.dimension)}`,
+  block_place: r => `${cPlayer(r.player)} placed ${cBlock(r.block)} ${at(r.location, r.dimension)}`,
+  block_interact: r => `${cPlayer(r.player)} used ${cBlock(r.block)} ${at(r.location, r.dimension)}`,
+  entity_interact: r =>
+    `${cPlayer(r.player)} interacted with ${cEntity(r.entity)}${r.targetName ? ` "${r.targetName}"` : ""} ${at(r.location, r.dimension)}`,
+  inventory_change: r =>
+    `${cPlayer(r.player)} inventory slot ${r.slot}: ${r.oldItem === "unknown" ? "empty" : cItem(r.oldItem)} -> ${r.newItem === "unknown" ? "empty" : cItem(r.newItem)}`,
+  item_use: r => `${cPlayer(r.player)} used item ${cItem(r.item)} ${at(r.location, r.dimension)}`,
+  entity_hurt: r =>
+    `${cWho(r.victim)} took ${Number(r.damage ?? 0).toFixed(1)} damage from ${r.attacker ? cWho(r.attacker) : short(r.cause)} ${at(r.location, r.dimension)}`,
+  entity_death: r =>
+    r.killer
+      ? `${cWho(r.killer)} killed ${cWho(r.entity)} ${at(r.location, r.dimension)}`
+      : `${cWho(r.entity)} died (${short(r.cause)}) ${at(r.location, r.dimension)}`,
+  dimension_change: r =>
+    `${cPlayer(r.player)} went from ${COLOR.dimension}${short(r.from)}${T} to ${COLOR.dimension}${short(r.to)}${T}`,
+  container_open: r => `${cPlayer(r.player)} opened ${cBlock(r.block)} ${at(r.location, r.dimension)}`,
+  entity_container_open: r => `${cPlayer(r.player)} opened ${cEntity(r.entity)} ${at(r.location, r.dimension)}`,
+  movement: r =>
+    `${cPlayer(r.player)} moved ${r.distance} blocks from ${xyz(r.from)} to ${xyz(r.to)} in ${COLOR.dimension}${short(r.to?.dimension)}${T}`,
+  gamemode_change: r => `${cPlayer(r.player)} changed game mode from ${r.from} to ${r.to}`,
+  craft: r => `${cPlayer(r.player)} crafted ${r.amount ?? 1}x ${cItem(r.item)}`,
+  item_drop: r => `${cPlayer(r.player)} dropped ${itemList(r.items)} ${at(r.location, r.dimension)}`,
+  item_pickup: r => `${cPlayer(r.player)} picked up ${itemList(r.items)} ${at(r.location, r.dimension)}`,
+  effect_add: r =>
+    `${cPlayer(r.player)} got effect ${short(r.effect)} level ${(r.amplifier ?? 0) + 1} for ${Math.round((r.durationTicks ?? 0) / 20)}s`,
+  lever: r => `${cPlayer(r.player)} turned a lever ${r.powered ? "ON" : "OFF"} ${at(r.location, r.dimension)}`,
+  button_push: r => `${cWho(r.by)} pushed ${cBlock(r.block)} ${at(r.location, r.dimension)}`,
+  explosion: r =>
+    `Explosion caused by ${cWho(r.cause)} destroyed ${r.blocksDestroyed} blocks ${at(r.location, r.dimension)}`,
+  projectile_hit: r =>
+    `${cWho(r.shooter)} hit ${cWho(r.victim)} with ${cEntity(r.projectile)} ${at(r.location, r.dimension)}`,
+  entity_tamed: r => `${cWho(r.player)} tamed ${cEntity(r.entity)} ${at(r.location, r.dimension)}`,
+  container_take: r =>
+    `${cPlayer(r.player)} took ${itemList(r.items)} from ${r.isBlock ? cBlock(r.container) : cEntity(r.container)} ${at(r.location, r.dimension)}`,
+  container_put: r =>
+    `${cPlayer(r.player)} put ${itemList(r.items)} into ${r.isBlock ? cBlock(r.container) : cEntity(r.container)} ${at(r.location, r.dimension)}`,
+  cursor_grab: r => `${cPlayer(r.player)} grabbed ${r.amount ?? 1}x ${cItem(r.item)} with the cursor`,
+  cursor_release: r => `${cPlayer(r.player)} placed ${r.amount ?? 1}x ${cItem(r.item)} from the cursor into a slot`,
+  piston: r => `${cBlock(r.block)} ${r.extending ? "extended" : "retracted"} ${at(r.location, r.dimension)}`,
+  pressure_plate: r => `${cPlayer(r.player)} stepped on ${cBlock(r.block)} ${at(r.location, r.dimension)}`,
+  tripwire: r => `${cPlayer(r.player)} tripped a ${cBlock("tripwire")} ${at(r.location, r.dimension)}`,
+  target_hit: r => `${cPlayer(r.player)} hit a ${cBlock("target")} block ${at(r.location, r.dimension)}`,
+  possible_dupe: r =>
+    `§l§cPOSSIBLE DUPE§r§f ${cPlayer(r.player)} gained ${itemList(r.items)} from nowhere ${at(r.location, r.dimension)}`,
+  illegal_stack: r =>
+    `§l§cIMPOSSIBLE STACK§r§f ${cPlayer(r.player)} is holding ${COLOR.item}${short(r.stack)}${T} ${at(r.location, r.dimension)}`,
+  emote: r => `${cPlayer(r.player)} did an emote`,
+};
+
+// Which filter button each event belongs to: P player, B blocks, E entity, I items, R redstone
+const CATEGORY = {
+  server_logger_started: "P", player_join: "P", player_leave: "P", player_spawn: "P", player_respawn: "P",
+  dimension_change: "P", gamemode_change: "P", emote: "P", effect_add: "P", movement: "P",
+  block_break: "B", block_place: "B", block_interact: "B", explosion: "B",
+  entity_interact: "E", entity_hurt: "E", entity_death: "E", projectile_hit: "E", entity_tamed: "E",
+  item_use: "I", craft: "I", item_drop: "I", item_pickup: "I", inventory_change: "I",
+  container_open: "I", entity_container_open: "I", container_take: "I", container_put: "I",
+  cursor_grab: "I", cursor_release: "I",
+  possible_dupe: "D", illegal_stack: "D",
+  lever: "R", button_push: "R", piston: "R", pressure_plate: "R", tripwire: "R", target_hit: "R",
+};
+
+const pad = n => String(n).padStart(2, "0");
+function timeStamp() {
+  const d = new Date(Date.now() + CONFIG.timezoneOffsetHours * 3600000);
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ` +
+    `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
+
+function emit(type, data = {}) {
+  let text;
+  try {
+    text = FORMAT[type] ? FORMAT[type](data) : `${type} ${JSON.stringify(data)}`;
+  } catch {
+    text = type;
+  }
+  const stamp = timeStamp();
+  buffer.push({ day: stamp.slice(0, 10), line: `${CATEGORY[type] ?? "P"}|${COLOR.time}${stamp.slice(11)}${T} ${text}` });
+  const plain = text.replace(/§./g, ""); // no color codes in the server console
+  if (CONFIG.consoleOutput === "warn") console.warn(`[ZEPHYCUBE_LOGS] ${stamp} | ${plain}`);
+  else if (CONFIG.consoleOutput === "log") console.log(`[ZEPHYCUBE_LOGS] ${stamp} | ${plain}`);
+}
+
+const isPlayer = ent => ent?.typeId === "minecraft:player";
+const who = ent => (isPlayer(ent) ? playerName(ent) : ent?.nameTag || safeType(ent));
+
+function subscribe(name, signal, handler) {
+  if (!signal) {
+    console.warn(`[ZEPHYCUBE_LOGS] Event "${name}" is not available on this server version, skipping it.`);
+    return;
+  }
+  try { signal.subscribe(handler); } catch (e) {
+    console.warn(`[ZEPHYCUBE_LOGS] Could not listen for "${name}": ${e}`);
+  }
+}
+
+/* ---------- database: logs are stored inside the world, one set per day ---------- */
+
+const DB_INDEX = "zclogs:index";
+const pageKey = (day, n) => `zclogs:${day}:${n}`;
+const buffer = []; // lines waiting to be saved: { day, line }
+
+function loadIndex() {
+  try { return JSON.parse(world.getDynamicProperty(DB_INDEX) ?? "{}"); } catch { return {}; }
+}
+function saveIndex(index) {
+  world.setDynamicProperty(DB_INDEX, JSON.stringify(index));
+}
+function deleteDay(index, day) {
+  const info = index[day];
+  if (!info) return;
+  for (let n = info.first; n <= info.last; n++) world.setDynamicProperty(pageKey(day, n), undefined);
+  delete index[day];
+}
+
+function flushToDatabase() {
+  if (buffer.length === 0) return;
+  const pending = buffer.splice(0, buffer.length);
+  try {
+    const index = loadIndex();
+    const open = {}; // day -> text of the page currently being filled
+    for (const { day, line } of pending) {
+      let info = index[day];
+      if (!info) {
+        info = index[day] = { first: 0, last: 0, lines: 0 };
+        open[day] = "";
+      } else if (open[day] === undefined) {
+        open[day] = world.getDynamicProperty(pageKey(day, info.last)) ?? "";
+      }
+      if (open[day].length > 0 && open[day].length + line.length + 1 > CONFIG.pageChars) {
+        world.setDynamicProperty(pageKey(day, info.last), open[day]);
+        info.last++;
+        open[day] = "";
+        if (info.last - info.first + 1 > CONFIG.maxPagesPerDay) {
+          world.setDynamicProperty(pageKey(day, info.first), undefined); // drop the oldest page
+          info.first++;
+        }
+      }
+      open[day] += (open[day] ? "\n" : "") + line;
+      info.lines++;
+    }
+    for (const day of Object.keys(open)) world.setDynamicProperty(pageKey(day, index[day].last), open[day]);
+
+    const days = Object.keys(index).sort();
+    while (days.length > CONFIG.keepDays) deleteDay(index, days.shift());
+    saveIndex(index);
+  } catch (e) {
+    console.warn(`[ZEPHYCUBE_LOGS] Could not save logs: ${e}`);
+  }
+}
+system.runInterval(flushToDatabase, CONFIG.saveIntervalTicks);
+
+/* ---------- in-game viewer ---------- */
+
+function canViewLogs(player) {
+  try {
+    if (player.hasTag(CONFIG.viewerTag)) return true;
+    const level = player.playerPermissionLevel;
+    if (typeof level === "number") return level >= 2;      // operator
+    if (typeof level === "string") return level === "Operator";
+    if (typeof player.isOp === "function") return player.isOp();
+  } catch {}
+  return false;
+}
+
+// A form cannot open while chat is still open, so keep trying for a few seconds.
+async function showForm(form, player) {
+  for (let i = 0; i < 100; i++) {
+    const res = await form.show(player);
+    if (res.cancelationReason !== "UserBusy") return res;
+    await new Promise(resolve => system.runTimeout(resolve, 4));
+  }
+  return { canceled: true };
+}
+
+async function openLogMenu(player) {
+  try {
+    if (!canViewLogs(player)) {
+      player.sendMessage("§cOnly operators can read ZephyCubeLogs.");
+      return;
+    }
+    flushToDatabase();
+    for (;;) {
+      const index = loadIndex();
+      const days = Object.keys(index).sort().reverse();
+      if (days.length === 0) { player.sendMessage("§eZephyCubeLogs: nothing saved yet."); return; }
+
+      const menu = new ActionFormData().title("ZephyCubeLogs").body("Pick a day:");
+      for (const day of days) menu.button(`${day}\n${index[day].lines} lines`);
+      const pick = await showForm(menu, player);
+      if (pick.canceled) return;
+
+      const day = days[pick.selection];
+      const backToDays = await openDay(player, day);
+      if (!backToDays) return;
+    }
+  } catch (e) {
+    console.warn(`[ZEPHYCUBE_LOGS] Log menu error: ${e}`);
+  }
+}
+
+// Filters shown as buttons after you pick a day.
+const FILTERS = [
+  { label: "All", cat: null },
+  { label: "Player\n§8join, leave, spawn, death", cat: "P" },
+  { label: "Blocks\n§8break, place, use", cat: "B" },
+  { label: "Entity\n§8fights, kills, taming", cat: "E" },
+  { label: "Items\n§8chests, drops, crafting", cat: "I" },
+  { label: "Redstone\n§8pistons, levers, buttons", cat: "R" },
+  { label: "§cPossible dupes\n§8items from nowhere", cat: "D" },
+  { label: "Search\n§8player name, block, anything", cat: "search" },
+];
+
+const lineCategory = line => (line[1] === "|" ? line[0] : "");
+const lineText = line => (line[1] === "|" ? line.slice(2) : line);
+
+function loadPages(day, cat, search) {
+  const info = loadIndex()[day];
+  if (!info) return null;
+  const needle = search ? search.toLowerCase() : null;
+  const pages = [];
+  let current = "";
+  for (let n = info.first; n <= info.last; n++) {
+    const raw = world.getDynamicProperty(pageKey(day, n));
+    if (!raw) continue;
+    for (const line of raw.split("\n")) {
+      if (cat && lineCategory(line) !== cat) continue;
+      const text = lineText(line);
+      if (needle && !text.replace(/§./g, "").toLowerCase().includes(needle)) continue;
+      if (current && current.length + text.length + 2 > CONFIG.pageChars) { pages.push(current); current = ""; }
+      current += (current ? "\n\n" : "") + text; // blank line between logs
+    }
+  }
+  if (current) pages.push(current);
+  return pages;
+}
+
+async function openDay(player, day) {
+  for (;;) {
+    const menu = new ActionFormData().title("ZephyCubeLogs").body(`§l§6${day}§r§f\nWhat do you want to see?`);
+    for (const f of FILTERS) menu.button(f.label);
+    menu.button("Back to days");
+    const pick = await showForm(menu, player);
+    if (pick.canceled) return false;
+    if (pick.selection >= FILTERS.length) return true;
+
+    const filter = FILTERS[pick.selection];
+    let cat = filter.cat, search = null, label = filter.label.split("\n")[0];
+    if (cat === "search") {
+      const ask = new ModalFormData().title("ZephyCubeLogs").textField("Show only logs containing:", "player name, block, item ...");
+      const res = await showForm(ask, player);
+      if (res.canceled) continue;
+      search = String(res.formValues?.[0] ?? "").trim();
+      if (!search) continue;
+      cat = null;
+      label = `Search "${search}"`;
+    }
+    const keepOpen = await viewPages(player, day, cat, search, label);
+    if (!keepOpen) return false;
+  }
+}
+
+// Returns true to go back to the filter buttons, false if the player closed the menu.
+async function viewPages(player, day, cat, search, label) {
+  let page = null; // null = newest
+  let pages = null;
+  for (;;) {
+    if (!pages) { flushToDatabase(); pages = loadPages(day, cat, search) ?? []; }
+    if (page === null || page >= pages.length) page = pages.length - 1;
+    if (page < 0) page = 0;
+
+    const header = `§l§6${day}§r§f - ${label} - page ${pages.length ? page + 1 : 0} of ${pages.length}`;
+    const form = new ActionFormData()
+      .title("ZephyCubeLogs")
+      .body(`${header}\n\n${pages[page] ?? "§7Nothing here yet."}`);
+    const buttons = [];
+    if (page > 0) { form.button("Older"); buttons.push("older"); }
+    if (page < pages.length - 1) { form.button("Newer"); buttons.push("newer"); }
+    form.button("Refresh"); buttons.push("refresh");
+    form.button("Back"); buttons.push("back");
+
+    const res = await showForm(form, player);
+    if (res.canceled) return false;
+    const action = buttons[res.selection];
+    if (action === "older") page--;
+    else if (action === "newer") page++;
+    else if (action === "refresh") { pages = null; page = null; }
+    else if (action === "back") return true;
+  }
+}
+
+// Way 1: the command /zc:logs (works with cheats off)
+try {
+  system.beforeEvents.startup.subscribe(init => {
+    try {
+      init.customCommandRegistry.registerCommand(
+        {
+          name: "zc:logs",
+          description: "Open the ZephyCubeLogs viewer",
+          permissionLevel: mc.CommandPermissionLevel?.Any ?? 0,
+          cheatsRequired: false
+        },
+        origin => {
+          const player = origin.sourceEntity;
+          if (player?.typeId === "minecraft:player") system.run(() => openLogMenu(player));
+          return { status: mc.CustomCommandStatus?.Success ?? 0 };
+        }
+      );
+    } catch (e) {
+      console.warn(`[ZEPHYCUBE_LOGS] Could not register /zc:logs: ${e}`);
+    }
+  });
+} catch (e) {
+  console.warn(`[ZEPHYCUBE_LOGS] Custom commands are not available on this server version: ${e}`);
+}
+
+// Way 2: use (right click / long press) an item renamed to "logs" in an anvil
+subscribe("itemUse", world.afterEvents.itemUse, e => {
+  if ((e.itemStack?.nameTag ?? "").trim().toLowerCase() !== CONFIG.viewerItemName) return;
+  if (e.source?.typeId === "minecraft:player") openLogMenu(e.source);
+});
+
+
+if (CONFIG.logJoinLeave) {
+  subscribe("playerJoin", world.afterEvents.playerJoin, e => {
+    emit("player_join", { player: e.playerName ?? "Unknown" });
+  });
+
+  subscribe("playerLeave", world.afterEvents.playerLeave, e => {
+    emit("player_leave", { player: e.playerName ?? "Unknown" });
+    lastPos.delete(e.playerId);
+    lastPlaceTick.delete(e.playerId);
+  });
+}
+
+if (CONFIG.logBlockBreak) {
+  subscribe("playerBreakBlock", world.afterEvents.playerBreakBlock, e => {
+    emit("block_break", {
+      player: playerName(e.player),
+      block: safeType(e.brokenBlockPermutation),
+      tool: safeType(e.itemStackBeforeBreak),
+      location: e.block?.location,
+      dimension: e.dimension?.id
+    });
+  });
+}
+
+if (CONFIG.logBlockPlace) {
+  subscribe("playerPlaceBlock", world.afterEvents.playerPlaceBlock, e => {
+    lastPlaceTick.set(e.player?.id, system.currentTick);
+    emit("block_place", {
+      player: playerName(e.player),
+      block: safeType(e.block?.permutation),
+      location: e.block?.location,
+      dimension: e.dimension?.id
+    });
+  });
+}
+
+if (CONFIG.logInteract) {
+  subscribe("playerInteractWithBlock", world.afterEvents.playerInteractWithBlock, e => {
+    if (!e.isFirstEvent) return;
+    if (justPlaced(e.player)) return; // part of placing a block, already logged
+    emit("block_interact", {
+      player: playerName(e.player),
+      block: safeType(e.block?.permutation),
+      location: e.block?.location,
+      face: e.blockFace,
+      item: safeType(e.itemStack),
+      dimension: e.block?.dimension?.id
+    });
+  });
+}
+
+if (CONFIG.logEntityInteract) {
+  subscribe("playerInteractWithEntity", world.afterEvents.playerInteractWithEntity, e => {
+    emit("entity_interact", {
+      player: playerName(e.player),
+      entity: safeType(e.target),
+      targetName: e.target?.nameTag ?? "",
+      location: e.target?.location,
+      dimension: e.target?.dimension?.id
+    });
+  });
+}
+
+if (CONFIG.logInventory) {
+  subscribe("playerInventoryItemChange", world.afterEvents.playerInventoryItemChange, e => {
+    emit("inventory_change", {
+      player: playerName(e.player),
+      slot: e.slot,
+      oldItem: safeType(e.beforeItemStack ?? e.oldItemStack),
+      newItem: safeType(e.itemStack ?? e.newItemStack)
+    });
+  });
+}
+
+if (CONFIG.logItemUse) {
+  subscribe("itemUse", world.afterEvents.itemUse, e => {
+    if (justPlaced(e.source)) return; // part of placing a block, already logged
+    if ((e.itemStack?.nameTag ?? "").trim().toLowerCase() === CONFIG.viewerItemName) return;
+    emit("item_use", {
+      player: playerName(e.source),
+      item: safeType(e.itemStack),
+      location: e.source?.location,
+      dimension: e.source?.dimension?.id
+    });
+  });
+}
+
+if (CONFIG.logCombat) {
+  subscribe("entityHurt", world.afterEvents.entityHurt, e => {
+    const victim = e.hurtEntity;
+    const attacker = e.damageSource?.damagingEntity;
+    if (!victim) return;
+    if (!isPlayer(victim) && !isPlayer(attacker)) return; // ignore mob vs mob
+    emit("entity_hurt", {
+      victim: who(victim),
+      attacker: attacker ? who(attacker) : "",
+      cause: e.damageSource?.cause,
+      damage: e.damage,
+      location: victim.location,
+      dimension: victim.dimension?.id
+    });
+  });
+}
+
+if (CONFIG.logDeath) {
+  subscribe("entityDie", world.afterEvents.entityDie, e => {
+    const ent = e.deadEntity;
+    const killer = e.damageSource?.damagingEntity;
+    if (!isPlayer(ent) && !isPlayer(killer)) return; // ignore mobs dying on their own
+    emit("entity_death", {
+      entity: who(ent),
+      killer: killer ? who(killer) : "",
+      cause: e.damageSource?.cause,
+      location: ent?.location,
+      dimension: ent?.dimension?.id
+    });
+  });
+}
+
+if (CONFIG.logDimension) {
+  subscribe("playerDimensionChange", world.afterEvents.playerDimensionChange, e => {
+    emit("dimension_change", {
+      player: playerName(e.player),
+      from: e.fromDimension?.id,
+      to: e.toDimension?.id,
+      location: e.player?.location
+    });
+  });
+}
+
+if (CONFIG.logContainer) {
+  // What was inside a container when a player opened it, so we can tell what
+  // they took or put in when they close it.
+  const openContainers = new Map(); // player id -> { name, isBlock, location, dimension, before }
+
+  const countItems = container => {
+    const counts = {};
+    if (!container) return null;
+    for (let i = 0; i < container.size; i++) {
+      const stack = container.getItem(i);
+      if (stack) counts[stack.typeId] = (counts[stack.typeId] ?? 0) + stack.amount;
+    }
+    return counts;
+  };
+  const inventoryOf = target => {
+    try { return target?.getComponent("minecraft:inventory")?.container; } catch { return undefined; }
+  };
+
+  const onOpen = (player, target, isBlock) => {
+    if (!isPlayer(player)) return;
+    const name = isBlock ? safeType(target?.permutation) : safeType(target);
+    const info = {
+      name, isBlock,
+      location: target?.location,
+      dimension: target?.dimension?.id,
+      before: null
+    };
+    try { info.before = countItems(inventoryOf(target)); } catch {}
+    openContainers.set(player.id, info);
+    emit(isBlock ? "container_open" : "entity_container_open", {
+      player: playerName(player),
+      block: name, entity: name,
+      location: info.location, dimension: info.dimension
+    });
+  };
+
+  const onClose = (player, target) => {
+    if (!isPlayer(player)) return;
+    const info = openContainers.get(player.id);
+    openContainers.delete(player.id);
+    if (!info?.before) return;
+    let after = null;
+    try { after = countItems(inventoryOf(target)); } catch {}
+    if (!after) return;
+    const took = [], put = [];
+    for (const id of new Set([...Object.keys(info.before), ...Object.keys(after)])) {
+      const diff = (after[id] ?? 0) - (info.before[id] ?? 0);
+      if (diff < 0) took.push({ item: id, amount: -diff });
+      else if (diff > 0) put.push({ item: id, amount: diff });
+    }
+    const base = {
+      player: playerName(player),
+      container: info.name, isBlock: info.isBlock,
+      location: info.location, dimension: info.dimension
+    };
+    if (took.length) emit("container_take", { ...base, items: took });
+    if (put.length) emit("container_put", { ...base, items: put });
+  };
+
+  subscribe("blockContainerOpened", world.afterEvents.blockContainerOpened, e =>
+    onOpen(e.openSource?.entity ?? e.player, e.block, true));
+  subscribe("blockContainerClosed", world.afterEvents.blockContainerClosed, e =>
+    onClose(e.closeSource?.entity ?? e.player, e.block));
+  subscribe("entityContainerOpened", world.afterEvents.entityContainerOpened, e =>
+    onOpen(e.openSource?.entity ?? e.player, e.entity, false));
+  subscribe("entityContainerClosed", world.afterEvents.entityContainerClosed, e =>
+    onClose(e.closeSource?.entity ?? e.player, e.entity));
+  subscribe("playerLeave", world.afterEvents.playerLeave, e => openContainers.delete(e.playerId));
+}
+
+if (CONFIG.logCursor) {
+  subscribe("playerCursorItemGrab", world.afterEvents.playerCursorItemGrab, e => {
+    emit("cursor_grab", { player: playerName(e.player), item: safeType(e.item), amount: e.item?.amount });
+  });
+  subscribe("playerCursorItemRelease", world.afterEvents.playerCursorItemRelease, e => {
+    emit("cursor_release", { player: playerName(e.player), item: safeType(e.item), amount: e.item?.amount });
+  });
+}
+
+// ---- Extra events (v1.1.0). Any event your server version does not have is
+// ---- skipped with a "Failed subscription" warning; the rest keep working.
+
+
+if (CONFIG.logSpawn) {
+  subscribe("playerSpawn", world.afterEvents.playerSpawn, e => {
+    emit(e.initialSpawn ? "player_spawn" : "player_respawn", {
+      player: playerName(e.player),
+      location: e.player?.location,
+      dimension: e.player?.dimension?.id
+    });
+  });
+}
+
+if (CONFIG.logGameMode) {
+  subscribe("playerGameModeChange", world.afterEvents.playerGameModeChange, e => {
+    if (e.fromGameMode === e.toGameMode) return;
+    emit("gamemode_change", {
+      player: playerName(e.player),
+      from: e.fromGameMode,
+      to: e.toGameMode
+    });
+  });
+}
+
+if (CONFIG.logCraft) {
+  subscribe("playerCraftRecipe", world.afterEvents.playerCraftRecipe, e => {
+    emit("craft", {
+      player: playerName(e.player),
+      item: safeType(e.itemStack),
+      amount: e.itemStack?.amount,
+      block: safeType(e.block)
+    });
+  });
+}
+
+if (CONFIG.logItemDropPickup) {
+  subscribe("entityItemDrop", world.afterEvents.entityItemDrop, e => {
+    if (!isPlayer(e.entity)) return;
+    const items = (e.items ?? []).map(it => {
+      try {
+        const stack = it.getComponent("minecraft:item")?.itemStack;
+        return { item: safeType(stack), amount: stack?.amount };
+      } catch { return { item: "unknown" }; }
+    });
+    emit("item_drop", {
+      player: playerName(e.entity),
+      items,
+      location: e.entity?.location,
+      dimension: e.entity?.dimension?.id
+    });
+  });
+
+  subscribe("entityItemPickup", world.afterEvents.entityItemPickup, e => {
+    if (!isPlayer(e.entity)) return;
+    emit("item_pickup", {
+      player: playerName(e.entity),
+      items: (e.items ?? []).map(stack => ({ item: safeType(stack), amount: stack?.amount })),
+      location: e.entity?.location,
+      dimension: e.entity?.dimension?.id
+    });
+  });
+}
+
+if (CONFIG.logEffects) {
+  subscribe("effectAdd", world.afterEvents.effectAdd, e => {
+    if (!isPlayer(e.entity)) return;
+    emit("effect_add", {
+      player: playerName(e.entity),
+      effect: safeType(e.effect),
+      amplifier: e.effect?.amplifier,
+      durationTicks: e.effect?.duration
+    });
+  });
+}
+
+if (CONFIG.logRedstone) {
+  subscribe("leverAction", world.afterEvents.leverAction, e => {
+    emit("lever", {
+      player: playerName(e.player),
+      powered: e.isPowered,
+      location: e.block?.location,
+      dimension: e.dimension?.id
+    });
+  });
+
+  subscribe("buttonPush", world.afterEvents.buttonPush, e => {
+    if (!isPlayer(e.source)) return;
+    emit("button_push", {
+      by: who(e.source),
+      block: safeType(e.block),
+      location: e.block?.location,
+      dimension: e.dimension?.id
+    });
+  });
+}
+
+if (CONFIG.logExplosion) {
+  subscribe("explosion", world.afterEvents.explosion, e => {
+    let blocks = [];
+    try { blocks = e.getImpactedBlocks(); } catch {}
+    emit("explosion", {
+      cause: e.source ? who(e.source) : "unknown",
+      blocksDestroyed: blocks.length,
+      location: e.source?.location ?? blocks[0]?.location,
+      dimension: e.dimension?.id
+    });
+  });
+}
+
+if (CONFIG.logProjectile) {
+  subscribe("projectileHitEntity", world.afterEvents.projectileHitEntity, e => {
+    if (!isPlayer(e.source)) return;
+    let victim;
+    try { victim = e.getEntityHit()?.entity; } catch {}
+    emit("projectile_hit", {
+      shooter: e.source ? who(e.source) : "unknown",
+      projectile: safeType(e.projectile),
+      victim: victim ? who(victim) : "unknown",
+      location: e.location,
+      dimension: e.dimension?.id
+    });
+  });
+}
+
+if (CONFIG.logTame) {
+  subscribe("entityTamed", world.afterEvents.entityTamed, e => {
+    emit("entity_tamed", {
+      player: who(e.tamingEntity),
+      entity: safeType(e.entity),
+      location: e.entity?.location,
+      dimension: e.entity?.dimension?.id
+    });
+  });
+}
+
+if (CONFIG.logEmote) {
+  subscribe("playerEmote", world.afterEvents.playerEmote, e => {
+    emit("emote", { player: playerName(e.player), emote: e.personaPieceId });
+  });
+}
+
+if (CONFIG.logRedstone) {
+  // Farms and clocks fire these many times a second, so each block is logged
+  // at most once per CONFIG.redstoneQuietSeconds.
+  const lastSeen = new Map();
+  const quiet = (kind, block, dimension) => {
+    const l = block?.location;
+    const key = `${kind}:${dimension?.id}:${l?.x},${l?.y},${l?.z}`;
+    const now = system.currentTick;
+    if (now - (lastSeen.get(key) ?? -1e9) < CONFIG.redstoneQuietSeconds * 20) return true;
+    if (lastSeen.size > 5000) lastSeen.clear();
+    lastSeen.set(key, now);
+    return false;
+  };
+
+  subscribe("pistonActivate", world.afterEvents.pistonActivate, e => {
+    if (quiet("piston", e.block, e.dimension)) return;
+    emit("piston", {
+      block: safeType(e.block),
+      extending: e.isExpanding,
+      location: e.block?.location,
+      dimension: e.dimension?.id
+    });
+  });
+
+  subscribe("pressurePlatePush", world.afterEvents.pressurePlatePush, e => {
+    if (!isPlayer(e.source)) return; // mobs walking on plates would flood the log
+    if (quiet("plate", e.block, e.dimension)) return;
+    emit("pressure_plate", {
+      player: playerName(e.source),
+      block: safeType(e.block),
+      location: e.block?.location,
+      dimension: e.dimension?.id
+    });
+  });
+
+  subscribe("tripWireTrip", world.afterEvents.tripWireTrip, e => {
+    if (!e.isPowered) return;
+    const player = (e.sources ?? []).find(isPlayer);
+    if (!player) return;
+    if (quiet("tripwire", e.block, e.dimension)) return;
+    emit("tripwire", {
+      player: playerName(player),
+      location: e.block?.location,
+      dimension: e.dimension?.id
+    });
+  });
+
+  subscribe("targetBlockHit", world.afterEvents.targetBlockHit, e => {
+    if (!isPlayer(e.source)) return;
+    emit("target_hit", {
+      player: playerName(e.source),
+      location: e.block?.location,
+      dimension: e.dimension?.id
+    });
+  });
+}
+
+// ---- Possible dupe detection --------------------------------------------
+// Every second, count everything each player is carrying. If items appear
+// from nowhere (nothing picked up, no container open, nothing else used up,
+// not in creative), it is logged as a POSSIBLE dupe. It is a hint, not proof.
+if (CONFIG.logPossibleDupe) {
+  const carried = new Map();       // player id -> { counts, tick }
+  const pickedUp = new Map();      // player id -> { itemId: amount } since the last check
+  const containerOpen = new Set(); // player ids with a chest etc open right now
+  const containerTick = new Map(); // player id -> last tick they opened or closed one
+  const watch = new Set(CONFIG.dupeWatchItems);
+  const EQUIP_SLOTS = ["Head", "Chest", "Legs", "Feet", "Offhand"];
+
+  const add = (counts, stack) => {
+    if (!stack) return;
+    counts[stack.typeId] = (counts[stack.typeId] ?? 0) + stack.amount;
+    if (stack.amount > (stack.maxAmount ?? 64)) counts["!illegal"] = `${stack.amount}x ${short(stack.typeId)}`;
+  };
+  const countCarried = player => {
+    const counts = {};
+    const inv = player.getComponent("minecraft:inventory")?.container;
+    if (inv) for (let i = 0; i < inv.size; i++) add(counts, inv.getItem(i));
+    try { add(counts, player.getComponent("minecraft:cursor_inventory")?.item); } catch {}
+    try {
+      const eq = player.getComponent("minecraft:equippable");
+      if (eq) for (const slot of EQUIP_SLOTS) add(counts, eq.getEquipment(slot));
+    } catch {}
+    return counts;
+  };
+
+  const touch = (player, open) => {
+    if (!isPlayer(player)) return;
+    containerTick.set(player.id, system.currentTick);
+    if (open) containerOpen.add(player.id); else containerOpen.delete(player.id);
+  };
+  subscribe("blockContainerOpened", world.afterEvents.blockContainerOpened, e => touch(e.openSource?.entity ?? e.player, true));
+  subscribe("blockContainerClosed", world.afterEvents.blockContainerClosed, e => touch(e.closeSource?.entity ?? e.player, false));
+  subscribe("entityContainerOpened", world.afterEvents.entityContainerOpened, e => touch(e.openSource?.entity ?? e.player, true));
+  subscribe("entityContainerClosed", world.afterEvents.entityContainerClosed, e => touch(e.closeSource?.entity ?? e.player, false));
+
+  subscribe("entityItemPickup", world.afterEvents.entityItemPickup, e => {
+    if (!isPlayer(e.entity)) return;
+    const got = pickedUp.get(e.entity.id) ?? {};
+    for (const stack of e.items ?? []) got[stack.typeId] = (got[stack.typeId] ?? 0) + stack.amount;
+    pickedUp.set(e.entity.id, got);
+  });
+
+  subscribe("playerLeave", world.afterEvents.playerLeave, e => {
+    carried.delete(e.playerId); pickedUp.delete(e.playerId);
+    containerOpen.delete(e.playerId); containerTick.delete(e.playerId);
+  });
+
+  const alertOperators = text => {
+    if (!CONFIG.dupeAlertOperators) return;
+    for (const p of world.getAllPlayers()) {
+      try { if (canViewLogs(p)) p.sendMessage(`§c[ZephyCubeLogs] §f${text}`); } catch {}
+    }
+  };
+
+  system.runInterval(() => {
+    for (const player of world.getAllPlayers()) {
+      try {
+        const id = player.id;
+        const before = carried.get(id);
+        const counts = countCarried(player);
+        const illegal = counts["!illegal"];
+        delete counts["!illegal"];
+        carried.set(id, { counts, tick: system.currentTick });
+        const got = pickedUp.get(id) ?? {};
+        pickedUp.delete(id);
+        if (!before) continue; // first look at this player, nothing to compare yet
+
+        const where = { location: player.location, dimension: player.dimension?.id };
+
+        if (illegal && before.illegal !== illegal) {
+          emit("illegal_stack", { player: playerName(player), stack: illegal, ...where });
+          alertOperators(`${playerName(player)} has an impossible stack: ${illegal}`);
+        }
+        carried.get(id).illegal = illegal;
+
+        let mode = "";
+        try { mode = String(player.getGameMode()).toLowerCase(); } catch {}
+        if (mode === "creative") continue;
+        if (containerOpen.has(id) || (containerTick.get(id) ?? -1) >= before.tick) continue;
+
+        const gained = [];
+        let usedSomething = false;
+        for (const item of new Set([...Object.keys(counts), ...Object.keys(before.counts)])) {
+          const diff = (counts[item] ?? 0) - (before.counts[item] ?? 0);
+          if (diff < 0) usedSomething = true; // crafting, trading, eating ... not a dupe
+          const unexplained = diff - (got[item] ?? 0);
+          if (unexplained > 0) gained.push({ item, amount: unexplained });
+        }
+        if (usedSomething) continue;
+
+        const suspicious = gained.filter(g => watch.has(g.item) || g.amount >= CONFIG.dupeMinAmount);
+        if (suspicious.length === 0) continue;
+
+        emit("possible_dupe", { player: playerName(player), items: suspicious, ...where });
+        alertOperators(`Possible dupe: ${playerName(player)} gained ${suspicious.map(g => `${g.amount}x ${short(g.item)}`).join(", ")}`);
+      } catch {}
+    }
+  }, CONFIG.dupeCheckTicks);
+}
+
+// Movement sampling: deliberately throttled to avoid flooding the server log/Discord.
+if (CONFIG.logMovement) {
+  system.runInterval(() => {
+    for (const p of world.getAllPlayers()) {
+      try {
+        const now = pos(p);
+        const old = lastPos.get(p.id);
+
+        if (!old) {
+          lastPos.set(p.id, now);
+          continue;
+        }
+
+        const dx = now.x - old.x;
+        const dy = now.y - old.y;
+        const dz = now.z - old.z;
+        const distance = Math.sqrt(dx*dx + dy*dy + dz*dz);
+
+        if (now.dimension !== old.dimension || distance >= CONFIG.movementMinDistance) {
+          emit("movement", {
+            player: playerName(p),
+            from: old,
+            to: now,
+            distance: Number(distance.toFixed(2))
+          });
+          lastPos.set(p.id, now);
+        }
+      } catch {}
+    }
+  }, CONFIG.movementIntervalTicks);
+}
+
+emit("server_logger_started", {
+  title: "ZephyCubeLogs",
+  author: "@iharvs",
+  betaApisRequired: false
+});
