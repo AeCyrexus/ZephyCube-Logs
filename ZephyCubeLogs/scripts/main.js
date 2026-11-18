@@ -11,15 +11,27 @@ const { world, system } = mc;
  * Logs are saved inside the world (one set per day) and read in the game:
  *   - type  /zc:logs
  *   - or use an item renamed to "logs" in an anvil
- * Only operators (or players with the tag "zc_logs") can open it.
+ * Chest scanner: use the Chest Scanner item (no recipe: /give @s zc:chest_scanner) or ANY item renamed to "scanner" in an anvil, and
+ *   right-click a chest, barrel, shulker box, hopper, furnace ... to see who
+ *   opened it, what was taken / put in, and who broke or placed it.
+ * Log file (v1.2.0): every event is also written, in plain readable text, to the
+ *   server's ContentLog file (see consoleOutput below).
+ * Only operators (or players with the tag "zc_logs") can open the viewer / scanner.
  */
 
 const CONFIG = {
   // Where each event goes besides the in-game database:
   //   "none" = nowhere else (no lag from the server log)
-  //   "log"  = also show in the live server console
-  //   "warn" = also write to the server's ContentLog file
-  consoleOutput: "none",
+  //   "log"  = also show in the live server console (info level)
+  //   "warn" = also show in the console AND write to the ContentLog file (readable text)
+  // A script cannot create files itself; the ContentLog file is how Bedrock saves
+  // script output. Turn it on in server.properties:  content-log-file-enabled=true
+  consoleOutput: "warn",
+  // Noisy events that are NOT sent to the file/console (they are still in the in-game viewer)
+  consoleSkip: ["inventory_change", "cursor_grab", "cursor_release", "item_use", "block_interact",
+    "effect_add", "item_drop", "item_pickup", "movement", "container_open", "entity_container_open"],
+  scannerItemName: "scanner",    // item renamed to this opens the chest scanner
+  scannerMaxResults: 60,         // newest entries shown per scan
   keepDays: 7,                   // older days are deleted automatically
   pageChars: 2500,               // text per page in the viewer
   maxPagesPerDay: 200,           // oldest pages of a day are dropped beyond this
@@ -191,6 +203,8 @@ const CATEGORY = {
   lever: "R", button_push: "R", piston: "R", pressure_plate: "R", tripwire: "R", target_hit: "R",
 };
 
+const CAT_NAME = { P: "PLAYER", B: "BLOCK", E: "ENTITY", I: "ITEM", R: "REDSTONE", D: "DUPE" };
+
 const pad = n => String(n).padStart(2, "0");
 function timeStamp() {
   const d = new Date(Date.now() + CONFIG.timezoneOffsetHours * 3600000);
@@ -207,9 +221,12 @@ function emit(type, data = {}) {
   }
   const stamp = timeStamp();
   buffer.push({ day: stamp.slice(0, 10), line: `${CATEGORY[type] ?? "P"}|${COLOR.time}${stamp.slice(11)}${T} ${text}` });
-  const plain = text.replace(/§./g, ""); // no color codes in the server console
-  if (CONFIG.consoleOutput === "warn") console.warn(`[ZEPHYCUBE_LOGS] ${stamp} | ${plain}`);
-  else if (CONFIG.consoleOutput === "log") console.log(`[ZEPHYCUBE_LOGS] ${stamp} | ${plain}`);
+  if (CONFIG.consoleOutput !== "none" && !CONFIG.consoleSkip.includes(type)) {
+    const plain = text.replace(/§./g, ""); // no color codes in the file
+    const line = `[ZephyCubeLogs] ${stamp} [${CAT_NAME[CATEGORY[type] ?? "P"]}] ${plain}`;
+    if (CONFIG.consoleOutput === "warn") console.warn(line);
+    else console.log(line);
+  }
 }
 
 const isPlayer = ent => ent?.typeId === "minecraft:player";
@@ -451,6 +468,113 @@ subscribe("itemUse", world.afterEvents.itemUse, e => {
   if (e.source?.typeId === "minecraft:player") openLogMenu(e.source);
 });
 
+/* ---------- chest scanner: right-click a container with an item renamed "scanner" ---------- */
+
+const SCANNER_ITEM_ID = "zc:chest_scanner"; // craftable / /give item
+const isScannerItem = item =>
+  item?.typeId === SCANNER_ITEM_ID || (item?.nameTag ?? "").trim().toLowerCase() === CONFIG.scannerItemName;
+const SCANNABLE = /(^|:)(chest|trapped_chest|barrel|hopper|dropper|dispenser|furnace|blast_furnace|smoker|brewing_stand|chiseled_bookshelf|crafter)$|shulker_box$|copper_chest$/;
+const DOUBLE_CHEST = /(^|:)(chest|trapped_chest)$|copper_chest$/;
+const LOC_RE = /\(X: (-?\d+), Y: (-?\d+), Z: (-?\d+)\)/;
+
+// The block itself, plus the neighbouring half when it is a double chest.
+function scanTargets(block) {
+  const list = [{ x: block.location.x, y: block.location.y, z: block.location.z }];
+  if (DOUBLE_CHEST.test(block.typeId)) {
+    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      try {
+        const n = block.dimension.getBlock({ x: block.location.x + dx, y: block.location.y, z: block.location.z + dz });
+        if (n && n.typeId === block.typeId) list.push({ x: n.location.x, y: n.location.y, z: n.location.z });
+      } catch {}
+    }
+  }
+  return list;
+}
+
+// Does this stored log line describe the container at one of these positions?
+function lineMatchesContainer(line, targets, dimShort) {
+  const cat = lineCategory(line);
+  if (cat !== "I" && cat !== "B") return false;
+  const t = lineText(line).replace(/§./g, "");
+  const m = LOC_RE.exec(t);
+  if (!m || !t.includes(` in ${dimShort}`)) return false;
+  if (!targets.some(p => Math.floor(p.x) === +m[1] && Math.floor(p.y) === +m[2] && Math.floor(p.z) === +m[3])) return false;
+  if (cat === "I") return /\bopened\b|\btook\b.+\bfrom\b|\bput\b.+\binto\b/.test(t);
+  return /\bbroke\b|\bplaced\b/.test(t);
+}
+
+// Newest first, across all saved days.
+function scanContainerHistory(targets, dimShort) {
+  flushToDatabase();
+  const index = loadIndex();
+  const out = [];
+  for (const day of Object.keys(index).sort().reverse()) {
+    const info = index[day];
+    for (let n = info.last; n >= info.first; n--) {
+      const raw = world.getDynamicProperty(pageKey(day, n));
+      if (!raw) continue;
+      const lines = raw.split("\n");
+      for (let i = lines.length - 1; i >= 0; i--) {
+        if (!lineMatchesContainer(lines[i], targets, dimShort)) continue;
+        out.push(`${COLOR.time}${day.slice(5)}${T} ${lineText(lines[i])}`);
+        if (out.length >= CONFIG.scannerMaxResults) return out;
+      }
+    }
+  }
+  return out;
+}
+
+function pageEntries(entries) {
+  const pages = [];
+  let current = "";
+  for (const text of entries) {
+    if (current && current.length + text.length + 2 > CONFIG.pageChars) { pages.push(current); current = ""; }
+    current += (current ? "\n\n" : "") + text;
+  }
+  if (current) pages.push(current);
+  return pages;
+}
+
+async function openScanner(player, block) {
+  try {
+    const type = block.typeId;
+    const l = block.location;
+    const dim = block.dimension.id;
+    const targets = scanTargets(block);
+    const entries = scanContainerHistory(targets, short(dim));
+    const pages = pageEntries(entries);
+    let page = 0;
+    const header = `§l§6${short(type)}§r§f ${xyz(l)} in ${COLOR.dimension}${short(dim)}${T}` +
+      (targets.length > 1 ? "\n§7(includes the other half of the double chest)§f" : "") +
+      `\n§7Newest first, showing ${entries.length} of the last ${CONFIG.keepDays} days${entries.length >= CONFIG.scannerMaxResults ? " (limit reached)" : ""}§f`;
+    for (;;) {
+      const form = new ActionFormData().title("Chest Scanner")
+        .body(`${header} - page ${pages.length ? page + 1 : 0}/${pages.length}\n\n${pages[page] ?? "§7No history for this container."}`);
+      const buttons = [];
+      if (page < pages.length - 1) { form.button("Older"); buttons.push("older"); }
+      if (page > 0) { form.button("Newer"); buttons.push("newer"); }
+      form.button("Close"); buttons.push("close");
+      const res = await showForm(form, player);
+      if (res.canceled) return;
+      const action = buttons[res.selection];
+      if (action === "older") page++;
+      else if (action === "newer") page--;
+      else return;
+    }
+  } catch (e) {
+    console.warn(`[ZEPHYCUBE_LOGS] Scanner error: ${e}`);
+  }
+}
+
+subscribe("playerInteractWithBlock (scanner)", world.beforeEvents.playerInteractWithBlock, e => {
+  if (!isScannerItem(e.itemStack)) return;
+  if (!SCANNABLE.test(e.block?.typeId ?? "")) return;
+  if (!canViewLogs(e.player)) return; // everyone else just uses the item normally
+  e.cancel = true;                    // do not open the container
+  const { player, block } = e;
+  system.run(() => openScanner(player, block));
+});
+
 
 if (CONFIG.logJoinLeave) {
   subscribe("playerJoin", world.afterEvents.playerJoin, e => {
@@ -530,6 +654,7 @@ if (CONFIG.logItemUse) {
   subscribe("itemUse", world.afterEvents.itemUse, e => {
     if (justPlaced(e.source)) return; // part of placing a block, already logged
     if ((e.itemStack?.nameTag ?? "").trim().toLowerCase() === CONFIG.viewerItemName) return;
+    if (isScannerItem(e.itemStack)) return;
     emit("item_use", {
       player: playerName(e.source),
       item: safeType(e.itemStack),
