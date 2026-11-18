@@ -1,6 +1,6 @@
 <p align="center"><img src="logo.png" alt="ZephyCube" width="160"></p>
 
-# ZephyCubeLogs v1.5.10
+# ZephyCubeLogs v1.6.0
 
 Activity logger for Minecraft Bedrock Edition: logs are stored in the world (one set per day) and read in game. No Beta APIs.
 
@@ -21,6 +21,10 @@ Operators can open the viewer. Players with the tag `zc_logs` can read logs too.
 
 - An item renamed `logs` in an anvil opens the viewer.
 - An item renamed `scanner` in an anvil, or the Chest Scanner (`/give @s zc:chest_scanner`), shows who opened, took from, put in, broke or placed the container you right-click.
+
+## Modules
+
+Every part can be turned off or on at runtime with `/zc:logsmodules <module> off|on` (no argument lists them). Details: `ZephyCubeLogs/FEATURES.md`.
 
 ## Notes
 
