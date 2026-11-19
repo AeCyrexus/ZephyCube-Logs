@@ -47,7 +47,7 @@ jobs:
               export GIT_COMMITTER_NAME=github-actions GIT_COMMITTER_EMAIL=actions@github.com
               IDX=$(mktemp -u)
               GIT_INDEX_FILE=$IDX git read-tree "$sha"
-              GIT_INDEX_FILE=$IDX git rm -rq --cached .github
+              GIT_INDEX_FILE=$IDX git rm -rqf --cached .github
               TREE=$(GIT_INDEX_FILE=$IDX git write-tree)
               PARENT=$(git rev-parse -q --verify "$sha^" || true)
               SNAP=$(git commit-tree "$TREE" ${PARENT:+-p "$PARENT"} -m "ZephyCubeLogs $TAG (release snapshot)")
