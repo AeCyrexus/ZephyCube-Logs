@@ -36,7 +36,7 @@ jobs:
             echo "Releasing $TAG from $sha"
             rm -rf build && mkdir -p build/src && git archive "$sha" | tar -x -C build/src
             NAME="ZephyCubeLogs-$TAG"
-            (cd build/src && zip -qr "../$NAME.zip" . -x '.github/*' '.gitignore')
+            (cd build/src && zip -qr "../$NAME.zip" ZephyCubeLogs)
             (cd build/src/ZephyCubeLogs && zip -qr "../../$NAME.mcpack" .)
             if ! gh release create "$TAG" "build/$NAME.zip" "build/$NAME.mcpack" \
               --target "$sha" --title "ZephyCubeLogs $TAG" --generate-notes; then
