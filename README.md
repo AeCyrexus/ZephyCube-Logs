@@ -1,6 +1,6 @@
 <p align="center"><img src="logo.png" alt="ZephyCube" width="160"></p>
 
-# ZephyCubeLogs v1.6.1
+# ZephyCubeLogs v1.6.2
 
 Activity logger for Minecraft Bedrock Edition: logs are stored in the world (one set per day) and read in game. No Beta APIs.
 
