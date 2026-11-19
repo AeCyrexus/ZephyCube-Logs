@@ -38,6 +38,21 @@ jobs:
             NAME="ZephyCubeLogs-$TAG"
             (cd build/src && zip -qr "../$NAME.zip" . -x '.github/*' '.gitignore')
             (cd build/src/ZephyCubeLogs && zip -qr "../../$NAME.mcpack" .)
-            gh release create "$TAG" "build/$NAME.zip" "build/$NAME.mcpack" \
-              --target "$sha" --title "ZephyCubeLogs $TAG" --generate-notes
+            if ! gh release create "$TAG" "build/$NAME.zip" "build/$NAME.mcpack" \
+              --target "$sha" --title "ZephyCubeLogs $TAG" --generate-notes; then
+              # GITHUB_TOKEN may not tag a commit that adds .github/workflows files.
+              # Retry on a snapshot commit with identical pack files minus .github.
+              echo "Retrying $TAG on a workflow-free snapshot commit"
+              export GIT_AUTHOR_NAME=github-actions GIT_AUTHOR_EMAIL=actions@github.com
+              export GIT_COMMITTER_NAME=github-actions GIT_COMMITTER_EMAIL=actions@github.com
+              IDX=$(mktemp -u)
+              GIT_INDEX_FILE=$IDX git read-tree "$sha"
+              GIT_INDEX_FILE=$IDX git rm -rq --cached .github
+              TREE=$(GIT_INDEX_FILE=$IDX git write-tree)
+              PARENT=$(git rev-parse -q --verify "$sha^" || true)
+              SNAP=$(git commit-tree "$TREE" ${PARENT:+-p "$PARENT"} -m "ZephyCubeLogs $TAG (release snapshot)")
+              git push origin "$SNAP:refs/tags/$TAG"
+              gh release create "$TAG" "build/$NAME.zip" "build/$NAME.mcpack" \
+                --title "ZephyCubeLogs $TAG" --generate-notes
+            fi
           done
