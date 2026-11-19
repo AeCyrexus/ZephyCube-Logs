@@ -1,7 +1,23 @@
 import * as mc from "@minecraft/server";
 import { ActionFormData, ModalFormData } from "@minecraft/server-ui";
+import { defineModules } from "./modules.js";
 
 const { world, system } = mc;
+
+// Modules (turn parts off with /zc:logsmodules <module> off). Event categories first, then extras.
+const modOn = defineModules("zclog", "zc:logsmodules", "Logs", [
+  { key: "player", label: "player events: join/leave, spawn, deaths, dimension, gamemode, emotes, effects, lag lines" },
+  { key: "blocks", label: "block break, place, interact and explosions" },
+  { key: "entities", label: "entity interact, hurt, death, projectiles, taming, mob farm notes" },
+  { key: "items", label: "item use, craft, drop, pickup, inventory changes, container take/put" },
+  { key: "redstone", label: "levers, buttons, pistons, pressure plates, tripwires, target blocks" },
+  { key: "dupes", label: "possible dupe and illegal stack detection (and its per-second scan)" },
+  { key: "staff_audit", label: "staff actions fed in by AdminTools (zc:audit)" },
+  { key: "movement", label: "throttled movement samples" },
+  { key: "chat", label: "chat messages" },
+  { key: "console", label: "copy of every log line to the server console / ContentLog file" },
+  { key: "scanner", label: "chest scanner item (right-click a container to see its history)" },
+]);
 
 /*
  * ZephyCubeLogs
@@ -352,7 +368,10 @@ system.runInterval(() => {
   } catch {}
 }, 200);
 
+const MOD_OF = { movement: "movement", chat: "chat" };
+const CAT_MOD = { P: "player", B: "blocks", E: "entities", I: "items", R: "redstone", D: "dupes", S: "staff_audit" };
 function emit(type, data = {}) {
+  if (!modOn(MOD_OF[type] ?? CAT_MOD[CATEGORY[type] ?? "P"])) return;
   if (FARM_QUIET.has(type) && (type === "piston" || data.mobVictim) && farmAt(data.dimension, data.location)) return;
   let text;
   try {
@@ -362,7 +381,7 @@ function emit(type, data = {}) {
   }
   const stamp = timeStamp();
   buffer.push({ day: stamp.slice(0, 10), line: `${CATEGORY[type] ?? "P"}|${COLOR.time}${stamp.slice(11)}${T} ${text}` });
-  if (CONFIG.consoleOutput !== "none" && !CONFIG.consoleSkip.includes(type)) {
+  if (CONFIG.consoleOutput !== "none" && modOn("console") && !CONFIG.consoleSkip.includes(type)) {
     const plain = text.replace(/§./g, ""); // no color codes in the file
     const catName = CAT_NAME[CATEGORY[type] ?? "P"];
     const line = `[ZephyCubeLogs] ${stamp} [${catName}] ${plain}`;
@@ -800,7 +819,7 @@ async function openScanner(player, block) {
 }
 
 subscribe("playerInteractWithBlock (scanner)", world.beforeEvents.playerInteractWithBlock, e => {
-  if (!isScannerItem(e.itemStack)) return;
+  if (!modOn("scanner") || !isScannerItem(e.itemStack)) return;
   if (!SCANNABLE.test(e.block?.typeId ?? "")) return;
   if (!canViewLogs(e.player)) return; // everyone else just uses the item normally
   e.cancel = true;                    // do not open the container
@@ -1484,6 +1503,7 @@ if (CONFIG.logPossibleDupe) {
   };
 
   system.runInterval(() => {
+    if (!modOn("dupes")) return;
     for (const player of world.getAllPlayers()) {
       try {
         const id = player.id;
@@ -1564,6 +1584,7 @@ if (CONFIG.logPossibleDupe) {
 // Movement sampling: deliberately throttled to avoid flooding the server log/Discord.
 if (CONFIG.logMovement) {
   system.runInterval(() => {
+    if (!modOn("movement")) return;
     for (const p of world.getAllPlayers()) {
       try {
         const now = pos(p);
