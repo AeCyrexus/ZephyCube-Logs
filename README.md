@@ -1,32 +1,14 @@
 <p align="center"><img src="logo.png" alt="ZephyCube" width="160"></p>
 
-# ZephyCubeLogs v1.6.0
+# ZephyCubeLogs v1.6.1
 
-Activity logger for Minecraft Bedrock Edition: logs are stored in the world (one set per day) and read in game. **Chat logging needs the "Beta APIs" experiment** enabled on the world; everything else uses stable APIs.
+Activity logger for Minecraft Bedrock Edition: logs are stored in the world (one set per day) and read in game. No Beta APIs.
 
 **Credit:** Originally created by iHarvs (@iharvs). ZephyCubeLogs continues that work.
 
 ## Install
 
-Copy the `ZephyCubeLogs` folder into your world's `behavior_packs` folder and add its `uuid` and `version` (from `manifest.json`) to the world's `world_behavior_packs.json`. Needs `@minecraft/server` 2.2.0-beta (Beta APIs experiment on) and `@minecraft/server-ui` 2.0.0.
-
-## Features
-
-- **Player:** join, leave, spawn, respawn, death inventory, dimension and gamemode changes, emotes, effects, lag lines
-- **Blocks:** break, place, interact, explosions
-- **Entities:** interact, hurt, death (player kills), projectile hits, taming, mob farm detection
-- **Items:** use, craft, drop, pickup, inventory changes, container take/put
-- **Redstone:** levers, buttons, pistons, pressure plates, tripwires, target blocks
-- **Dupe detection:** possible-dupe and illegal-stack hints
-- **Staff audit:** staff actions via `scriptevent zc:audit player|action|target|detail`
-- **Movement:** throttled samples (off by default)
-- **Chat:** chat messages (**needs Beta APIs**)
-- **Console:** copy of each line to the server console / ContentLog
-- **Chest scanner:** see who opened, took from, put in, broke or placed a container
-- **In-game viewer:** pick a day, filter by category, search
-- **TPS monitor:** `/zc:tps`, plus a LAG line when TPS drops under 15
-
-Each module can be toggled at runtime with `/zc:logsmodules <module> off|on`. Full details: `ZephyCubeLogs/FEATURES.md`.
+Copy the `ZephyCubeLogs` folder into your world's `behavior_packs` folder and add its `uuid` and `version` (from `manifest.json`) to the world's `world_behavior_packs.json`. Needs `@minecraft/server` 2.2.0 and `@minecraft/server-ui` 2.0.0.
 
 ## Commands
 
