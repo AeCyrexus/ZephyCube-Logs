@@ -9,7 +9,7 @@ Activity logger with an in-game viewer, a chest scanner and a TPS monitor. Origi
 
 ## Install
 
-Download `ZephyCubeLogs-v1.6.3.mcpack` from the Releases page and open it. Or install by hand: copy the `ZephyCubeLogs` folder into your world's `behavior_packs` folder and add its `uuid` and `version` (from `manifest.json`) to the world's `world_behavior_packs.json`. Needs `@minecraft/server` 2.2.0 and `@minecraft/server-ui` 2.0.0.
+Download `ZephyCubeLogs-v1.6.3-BP.mcaddon` (behavior pack; this add-on has no resource pack) or `ZephyCubeLogs-v1.6.3.mcpack` from the Releases page and open it. Or install by hand: copy the `ZephyCubeLogs` folder into your world's `behavior_packs` folder and add its `uuid` and `version` (from `manifest.json`) to the world's `world_behavior_packs.json`. Needs `@minecraft/server` 2.2.0 and `@minecraft/server-ui` 2.0.0.
 
 ## Features (modules)
 `/zc:logsmodules <module> off|on` (no argument lists them). Saved in the world. Turning a module off stops new lines of that kind; saved lines stay readable.
